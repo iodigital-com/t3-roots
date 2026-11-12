@@ -139,6 +139,9 @@ export function resolveSourceControlWriterModelSelection(
   projectId: ProjectId | null,
 ): ModelSelection {
   const selection = settings.sourceControlWriterModelSelection;
+  if (settings.textGenerationFallbackPolicy === "selected-only") {
+    return selection ?? settings.textGenerationModelSelection;
+  }
   return selection &&
     resolveTextGenerationSelectionEnabled(settings, projectId, selection.instanceId) &&
     isTextGenerationTargetUsable(settings, providers, selection.instanceId)
@@ -152,6 +155,9 @@ export function resolveReviewGuideModelSelection(
   projectId: ProjectId | null,
 ): ModelSelection {
   const selection = settings.reviewGuideModelSelection;
+  if (settings.textGenerationFallbackPolicy === "selected-only") {
+    return selection ?? resolveSourceControlWriterModelSelection(settings, providers, projectId);
+  }
   // Text generators cannot investigate a checkout, so they never write review guides.
   return selection &&
     textGeneratorForSelection(settings, selection.instanceId) === undefined &&
@@ -167,6 +173,9 @@ export function resolveSpeechPostProcessingModelSelection(
   providers?: ReadonlyArray<ServerProvider>,
 ): ModelSelection {
   const selection = settings.speechPostProcessingModelSelection;
+  if (settings.textGenerationFallbackPolicy === "selected-only") {
+    return selection ?? settings.textGenerationModelSelection;
+  }
   return selection &&
     isModelSelectionProviderEnabled(settings, selection) &&
     isTextGenerationTargetUsable(settings, providers, selection.instanceId)

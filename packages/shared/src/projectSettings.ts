@@ -132,6 +132,9 @@ function resolveProjectOverrides(
     ...ENVIRONMENT_SOURCES,
   };
   const effective: Record<string, unknown> = { ...settings };
+  const selectedOnly =
+    (overrides.textGenerationFallbackPolicy ?? settings.textGenerationFallbackPolicy) ===
+    "selected-only";
   for (const key of PROJECT_SCOPED_SERVER_SETTING_KEYS) {
     if (!Object.hasOwn(overrides, key)) continue;
     const value = overrides[key];
@@ -141,6 +144,7 @@ function resolveProjectOverrides(
       (key === "textGenerationModelSelection" || key === "defaultModelSelection") &&
       value !== undefined &&
       value !== null &&
+      !(key === "textGenerationModelSelection" && selectedOnly) &&
       !(
         key === "textGenerationModelSelection"
           ? resolveTextGenerationSelectionEnabled
@@ -168,7 +172,10 @@ function resolveProjectOverrides(
     sources[key] = "project";
   }
   const textGeneration = effective.textGenerationModelSelection as ModelSelection;
-  if (!resolveTextGenerationSelectionEnabled(settings, projectId, textGeneration.instanceId)) {
+  if (
+    !selectedOnly &&
+    !resolveTextGenerationSelectionEnabled(settings, projectId, textGeneration.instanceId)
+  ) {
     const fallback = fallbackTextGenerationModelSelection(
       settings.providerInstances,
       (instanceId) => resolveProjectProviderInstanceEnabled(settings, projectId, instanceId),
