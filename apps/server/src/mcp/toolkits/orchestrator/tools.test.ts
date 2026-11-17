@@ -5,6 +5,13 @@ import { Tool } from "effect/ai";
 
 import { OrchestratorToolkit } from "./tools.ts";
 
+it("states the instance and backend limits on delegation models", () => {
+  const description = OrchestratorToolkit.tools.orchestrator_capabilities.description;
+  expect(description).toContain("enabled instances with `canRunChildTask`");
+  expect(description).toContain("backend may still refuse");
+  expect(description).not.toContain("Any catalog model works");
+});
+
 // Oversized page sizes clamp on decode, so the schema has no `maximum`; Codex also drops
 // bounds from its TypeScript view. The description is the only place a model sees a limit.
 it("states t3_thread_read page size limits in the parameter descriptions", () => {
