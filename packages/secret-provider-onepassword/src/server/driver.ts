@@ -65,10 +65,25 @@ const parseCaptureValues = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.NullOr(Schema.String))),
 );
 
+type EnvironmentVariables = ReadonlyArray<readonly [environmentId: string, variables: Set<string>]>;
+
+// `op run` takes several Environments in one call, so one unlock reads them all. A variable in two
+// Environments would take the last one's value, so those go in separate calls.
+const groupWithoutOverlap = (environments: Map<string, Set<string>>) => {
+  const groups: Array<Array<readonly [string, Set<string>]>> = [];
+  for (const entry of environments) {
+    const fits = groups.find((group) =>
+      group.every(([, variables]) => [...entry[1]].every((name) => !variables.has(name))),
+    );
+    if (fits) fits.push(entry);
+    else groups.push([entry]);
+  }
+  return groups;
+};
+
 const readEnvironment = Effect.fn("OnePasswordDriver.readEnvironment")(function* (
   account: OnePasswordAccount,
-  environmentId: string,
-  variables: ReadonlyArray<string>,
+  environments: EnvironmentVariables,
   itemReferences: ReadonlyArray<string>,
   selectedVariables: ReadonlyArray<string>,
 ) {
@@ -88,7 +103,10 @@ const readEnvironment = Effect.fn("OnePasswordDriver.readEnvironment")(function*
     ),
   );
   for (const { name, reference } of selected) environment[name] = reference;
-  const names = [...variables, ...selected.map(({ name }) => name)];
+  const variables = environments.flatMap(([environmentId, names]) =>
+    [...names].map((name) => ({ name, reference: `op-env://${environmentId}/${name}` })),
+  );
+  const names = [...variables, ...selected].map(({ name }) => name);
   const helperPath = yield* fileSystem.makeTempFileScoped({
     prefix: "t3code-op-capture-",
     suffix: ".cjs",
@@ -107,8 +125,7 @@ const readEnvironment = Effect.fn("OnePasswordDriver.readEnvironment")(function*
       "run",
       `--account=${account}`,
       "--no-masking",
-      "--environment",
-      environmentId,
+      ...environments.flatMap(([environmentId]) => ["--environment", environmentId]),
       "--",
       helperCommand.command,
       ...helperCommand.args,
@@ -116,7 +133,14 @@ const readEnvironment = Effect.fn("OnePasswordDriver.readEnvironment")(function*
     environment,
   );
   const decoded = parseCaptureValues(result.stdout);
-  if (result.code !== 0 || Option.isNone(decoded)) return undefined;
+  if (result.code !== 0 || Option.isNone(decoded)) {
+    yield* Effect.logWarning("Could not read 1Password Environments", {
+      stage: "environment",
+      exitCode: result.code,
+      environments: environments.length,
+    });
+    return undefined;
+  }
   const values = decoded.value;
   if (Object.keys(values).length !== names.length) return undefined;
   const captured = new Map<string, string | undefined>();
@@ -131,12 +155,11 @@ const readEnvironment = Effect.fn("OnePasswordDriver.readEnvironment")(function*
       return undefined;
     captured.set(name, value);
   }
-  return new Map([
-    ...variables.map(
-      (variable) => [`op-env://${environmentId}/${variable}`, captured.get(variable)] as const,
+  return new Map(
+    [...variables, ...selected].map(
+      ({ name, reference }) => [reference, captured.get(name)] as const,
     ),
-    ...selected.map(({ name, reference }) => [reference, captured.get(name)] as const),
-  ]);
+  );
 }, Effect.scoped);
 
 const readOne = Effect.fn("OnePasswordDriver.readOne")(function* (
@@ -246,12 +269,12 @@ export const driver = defineSecretProviderDriver({
       if (environments.size === 0) return yield* readItems(account, references, values);
       const selectedVariables = [...environments.values()].flatMap((variables) => [...variables]);
       let includeItems = true;
-      for (const [environmentId, variables] of environments) {
+      for (const group of groupWithoutOverlap(environments)) {
         const attachedItems = includeItems ? [...items] : [];
         includeItems = false;
         const captured = yield* recover(
           "environment",
-          readEnvironment(account, environmentId, [...variables], attachedItems, selectedVariables),
+          readEnvironment(account, group, attachedItems, selectedVariables),
         );
         if (captured !== undefined) {
           for (const [reference, value] of captured) values.set(reference, value);

@@ -92,8 +92,10 @@ const runFrom =
   ) =>
   (args: ReadonlyArray<string>, inherited: NodeJS.ProcessEnv): OpResult => {
     if (!args.includes("run")) return { code: 1 };
-    const id = args[args.indexOf("--environment") + 1]!;
-    const environment = { ...inherited, ...environments[id] };
+    const environment = { ...inherited };
+    args.forEach((word, index) => {
+      if (word === "--environment") Object.assign(environment, environments[args[index + 1]!]);
+    });
     for (const [name, value] of Object.entries(environment)) {
       if (value?.startsWith("op://") && items[value] !== undefined)
         environment[name] = items[value];
@@ -262,6 +264,27 @@ describe("1Password driver", () => {
       }).pipe(Effect.provide(op.layer));
     },
   );
+
+  it.effect("reads every Environment and item in one call when no variable overlaps", () => {
+    const op = fakeOp(
+      runFrom(
+        { "env-a": { A_KEY: "a" }, "env-b": { B_KEY: "b" }, "env-c": { C_KEY: "c" } },
+        { "op://Private/Jira/credential": "jira" },
+      ),
+    );
+    return Effect.gen(function* () {
+      assert.deepStrictEqual(
+        yield* driver.read({ account }, [
+          "op-env://env-a/A_KEY",
+          "op://Private/Jira/credential",
+          "op-env://env-b/B_KEY",
+          "op-env://env-c/C_KEY",
+        ]),
+        ["a", "jira", "b", "c"],
+      );
+      assert.strictEqual(op.invocations.length, 1);
+    }).pipe(Effect.provide(op.layer));
+  });
 
   it.effect("keeps overlapping variables in separate Environment captures", () => {
     const op = fakeOp(runFrom({ "env-a": { API_KEY: "a" }, "env-b": { API_KEY: "b" } }));
