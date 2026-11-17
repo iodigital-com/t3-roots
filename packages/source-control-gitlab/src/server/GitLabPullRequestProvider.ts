@@ -148,6 +148,7 @@ export const make = Effect.gen(function* () {
         Effect.catchIf(
           (cause) =>
             cause._tag !== "GitLabCliUnavailableError" &&
+            cause._tag !== "GitLabAccessTokenReadError" &&
             cause._tag !== "GitLabCliAuthenticationError" &&
             cause._tag !== "GitLabCliRateLimitError",
           () => Effect.succeed(false),
@@ -221,7 +222,8 @@ export const make = Effect.gen(function* () {
     read.pipe(
       Effect.catch((error) => {
         const { reason } = gitLabProviderFailure(error);
-        return reason === "rate-limited" ||
+        return error._tag === "GitLabAccessTokenReadError" ||
+          reason === "rate-limited" ||
           reason === "unauthenticated" ||
           reason === "missing-tool"
           ? Effect.fail(error)

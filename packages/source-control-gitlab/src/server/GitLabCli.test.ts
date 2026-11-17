@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { ChildProcessSpawner } from "effect/process";
 
-import { DEFAULT_SERVER_SETTINGS, VcsProcessExitError } from "@t3tools/contracts";
+import { DEFAULT_SERVER_SETTINGS, SecretProviderId, VcsProcessExitError } from "@t3tools/contracts";
 
 import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
@@ -23,6 +23,48 @@ function processOutput(stdout: string): SourceControlHost.SourceControlProcessOu
     stderrTruncated: false,
   };
 }
+
+it.effect.each(["detail", "list", "execute"] as const)(
+  "refuses a %s read before running glab when the configured token is unreadable",
+  (operation) =>
+    Effect.gen(function* () {
+      const run = vi.fn<SourceControlHost.SourceControlHost["Service"]["process"]["run"]>();
+      const glab = yield* GitLabCli.make.pipe(
+        Effect.provide(
+          TestSourceControlHost.layer({
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              sourceControlHosts: {
+                gitlab: {
+                  accessToken: {
+                    provider: SecretProviderId.make("onepassword"),
+                    reference: "op://Private/item/token",
+                  },
+                },
+              },
+            },
+            process: { run },
+          }),
+        ),
+      );
+      const read =
+        operation === "detail"
+          ? glab.getMergeRequest({ cwd: "/repo", reference: "7" }).pipe(Effect.asVoid)
+          : operation === "list"
+            ? glab
+                .listMergeRequests({ cwd: "/repo", headSelector: "feature", state: "open" })
+                .pipe(Effect.asVoid)
+            : glab.execute({ cwd: "/repo", args: ["api", "user"] }).pipe(Effect.asVoid);
+      const error = yield* read.pipe(Effect.flip);
+      expect(error._tag).toBe("GitLabAccessTokenReadError");
+      expect(error.message).toContain("could not be read from the secret provider");
+      expect(error.message).toContain(
+        "Settings → Source control → GitLab → check the access token",
+      );
+      expect(error.message).not.toContain("op://");
+      expect(run).not.toHaveBeenCalled();
+    }),
+);
 
 afterEach(() => {
   mockedRun.mockReset();

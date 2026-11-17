@@ -1838,6 +1838,7 @@ export const make = Effect.gen(function* () {
   // surrounding operation for. An unusable CLI or account still reaches the caller.
   const isOptionalReadFailure = (cause: GitLabPullRequestCliError) =>
     cause._tag !== "GitLabCliUnavailableError" &&
+    cause._tag !== "GitLabAccessTokenReadError" &&
     cause._tag !== "GitLabCliAuthenticationError" &&
     cause._tag !== "GitLabCliRateLimitError";
 
@@ -2222,6 +2223,7 @@ export const make = Effect.gen(function* () {
         Effect.catchIf(
           (cause) =>
             cause._tag !== "GitLabCliUnavailableError" &&
+            cause._tag !== "GitLabAccessTokenReadError" &&
             cause._tag !== "GitLabCliAuthenticationError" &&
             cause._tag !== "GitLabCliRateLimitError",
           (cause) =>
@@ -2616,6 +2618,7 @@ export const make = Effect.gen(function* () {
               Effect.catchIf(
                 (cause) =>
                   cause._tag !== "GitLabCliUnavailableError" &&
+                  cause._tag !== "GitLabAccessTokenReadError" &&
                   cause._tag !== "GitLabCliAuthenticationError" &&
                   cause._tag !== "GitLabCliRateLimitError",
                 (cause) =>

@@ -71,6 +71,28 @@ export class GitLabCliAuthenticationError extends Schema.TaggedError<GitLabCliAu
   }
 }
 
+export class GitLabAccessTokenReadError extends Schema.TaggedError<GitLabAccessTokenReadError>()(
+  "GitLabAccessTokenReadError",
+  {
+    operation: Schema.Literal("readAccessToken"),
+    command: Schema.Literal("glab"),
+    cwd: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  get detail(): string {
+    return "The GitLab access token could not be read from the secret provider (for example, 1Password is locked). Unlock it, then use Settings → Source control → GitLab → check the access token, and retry.";
+  }
+
+  get userFacingDetail(): string {
+    return this.detail;
+  }
+
+  override get message(): string {
+    return this.detail;
+  }
+}
+
 export class GitLabCliRateLimitError extends Schema.TaggedError<GitLabCliRateLimitError>()(
   "GitLabCliRateLimitError",
   gitLabCliExecutionErrorContext,
@@ -244,6 +266,7 @@ export class GitLabNamespaceDecodeError extends Schema.TaggedError<GitLabNamespa
 export const GitLabCliError = Schema.Union([
   GitLabCliUnavailableError,
   GitLabCliAuthenticationError,
+  GitLabAccessTokenReadError,
   GitLabCliRateLimitError,
   GitLabMergeRequestNotFoundError,
   GitLabCliCommandError,
@@ -464,7 +487,7 @@ export const make = Effect.gen(function* () {
   const { process, settings: hostSettings } = yield* SourceControlHost.SourceControlHost;
 
   // The saved token, if any. Its secret reference is read once and cached by the server, so polling
-  // never asks the secret provider again. An unreadable token falls back to glab's own login.
+  // never asks the secret provider again. Only the Settings secret check retries a failed read.
   const savedToken = hostSettings.getWithSecrets(GitLabDefinition.definition.kind).pipe(
     Effect.flatMap((settings) =>
       requireSettingsSecretLiteral(
@@ -476,10 +499,6 @@ export const make = Effect.gen(function* () {
       ),
     ),
     Effect.map((token) => token.trim()),
-    Effect.catch(() =>
-      // No cause: a settings decode error can quote a hand-edited token.
-      Effect.logWarning("failed to read the GitLab access token from settings").pipe(Effect.as("")),
-    ),
   );
 
   const run = (
@@ -487,26 +506,36 @@ export const make = Effect.gen(function* () {
     mapError: (error: VcsError) => GitLabCliError,
   ) =>
     savedToken.pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitLabAccessTokenReadError({
+            operation: "readAccessToken",
+            command: "glab",
+            cwd: input.cwd,
+            cause,
+          }),
+      ),
       Effect.flatMap((token) => {
         const env = {
           // glab may otherwise prefer a different checkout remote.
           ...(input.host === undefined ? {} : { GITLAB_HOST: input.host }),
           ...(token === "" ? {} : { GITLAB_TOKEN: token }),
         };
-        return process.run({
-          operation: "GitLabCli.execute",
-          command: "glab",
-          args: input.args,
-          cwd: input.cwd,
-          ...(Object.keys(env).length === 0 ? {} : { env }),
-          classifyFailure: classifyGlabFailure,
-          notFoundDetail: "Merge request not found.",
-          timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-          ...(input.stdin === undefined ? {} : { stdin: input.stdin }),
-          ...(input.maxOutputBytes === undefined ? {} : { maxOutputBytes: input.maxOutputBytes }),
-        });
+        return process
+          .run({
+            operation: "GitLabCli.execute",
+            command: "glab",
+            args: input.args,
+            cwd: input.cwd,
+            ...(Object.keys(env).length === 0 ? {} : { env }),
+            classifyFailure: classifyGlabFailure,
+            notFoundDetail: "Merge request not found.",
+            timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+            ...(input.stdin === undefined ? {} : { stdin: input.stdin }),
+            ...(input.maxOutputBytes === undefined ? {} : { maxOutputBytes: input.maxOutputBytes }),
+          })
+          .pipe(Effect.mapError(mapError));
       }),
-      Effect.mapError(mapError),
     );
 
   const execute: GitLabCli["Service"]["execute"] = (input) =>

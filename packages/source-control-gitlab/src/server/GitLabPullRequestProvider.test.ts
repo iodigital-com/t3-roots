@@ -2,12 +2,65 @@ import { assert, describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
+import { DEFAULT_SERVER_SETTINGS, SecretProviderId } from "@t3tools/contracts";
+import { vi } from "vite-plus/test";
+import type * as SourceControlHost from "@t3tools/source-control-core/server/SourceControlHost";
 
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 
 import * as GitLabCli from "./GitLabCli.ts";
 import * as GitLabPullRequestCli from "./GitLabPullRequestCli.ts";
 import { gitLabViewerPermissions, make } from "./GitLabPullRequestProvider.ts";
+
+it.effect.each(["detail", "list"] as const)(
+  "preserves the token recovery instructions through the MR %s provider",
+  (operation) =>
+    Effect.gen(function* () {
+      const run = vi.fn<SourceControlHost.SourceControlHost["Service"]["process"]["run"]>();
+      const services = GitLabPullRequestCli.layer.pipe(
+        Layer.provideMerge(GitLabCli.layer),
+        Layer.provide(
+          TestSourceControlHost.layer({
+            settings: {
+              ...DEFAULT_SERVER_SETTINGS,
+              sourceControlHosts: {
+                gitlab: {
+                  accessToken: {
+                    provider: SecretProviderId.make("onepassword"),
+                    reference: "op://Private/item/token",
+                  },
+                },
+              },
+            },
+            process: { run },
+          }),
+        ),
+      );
+      const provider = yield* make.pipe(Effect.provide(services));
+      const reference = {
+        cwd: "/repo",
+        repository: "acme/web",
+        host: "gitlab.example.test",
+        number: 7,
+      };
+      const read =
+        operation === "detail"
+          ? provider.getChangeRequest(reference).pipe(Effect.asVoid)
+          : provider
+              .listChangeRequests({
+                ...reference,
+                state: "open",
+                involvement: "all",
+                viewer: "user",
+                limit: 20,
+              })
+              .pipe(Effect.asVoid);
+      const error = yield* read.pipe(Effect.flip);
+      expect(error.reason).toBe("failed");
+      expect(error.detail).toContain("Settings → Source control → GitLab → check the access token");
+      expect(run).not.toHaveBeenCalled();
+    }),
+);
 
 it.effect.each(["merge", "disable-auto-merge"] as const)(
   "keeps reads and %s on the selected host when glab prefers another remote",
