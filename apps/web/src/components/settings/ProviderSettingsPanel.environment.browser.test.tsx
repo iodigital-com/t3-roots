@@ -352,6 +352,7 @@ describe("EnvironmentProviderSettings routing", () => {
         [customId]: {
           driver: ProviderDriverKind.make("codex"),
           config: { customModels: [first, second] },
+          modelAllowlist: ["model-a", "model-b"],
         },
       },
     };
@@ -380,6 +381,10 @@ describe("EnvironmentProviderSettings routing", () => {
     expect(state.mutateProviderInstance.mock.calls[2]?.[0].instance.config.customModels).toEqual([
       first,
       { ...second, name: "Entered B" },
+    ]);
+    expect(state.mutateProviderInstance.mock.calls[2]?.[0].instance.modelAllowlist).toEqual([
+      "model-a",
+      "model-b",
     ]);
   });
 

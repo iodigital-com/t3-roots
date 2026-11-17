@@ -353,7 +353,7 @@ const buildEntry = Effect.fn("ProviderInstanceRegistry.buildEntry")(function* <R
   return {
     kind: "live" as const,
     live: {
-      instance: createResult.success,
+      instance: { ...createResult.success, modelAllowlist: entry.modelAllowlist },
       scope: childScope,
       entry,
       secrets,

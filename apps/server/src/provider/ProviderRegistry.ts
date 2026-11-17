@@ -31,6 +31,7 @@ import * as ModelManifest from "./ModelManifest.ts";
 import { applyProviderCompatibility } from "./providerCompatibility.ts";
 import * as ServerConfig from "../config.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
+import { applyProviderModelAllowlist } from "./providerModelAllowlist.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import {
   hydrateCachedProvider,
@@ -1261,28 +1262,60 @@ export const layer = Layer.effect(
       }
     });
 
+    // Filter only advertised snapshots so removing a restriction restores the held catalogs.
+    const advertiseProviders = Effect.fn("ProviderRegistry.advertiseProviders")(function* (
+      providers: ReadonlyArray<ServerProvider>,
+    ) {
+      const instances = yield* instanceRegistry.listInstances;
+      if (!instances.some((instance) => (instance.modelAllowlist?.length ?? 0) > 0))
+        return providers;
+      const allowlists = new Map(
+        instances.map((instance) => [instance.instanceId, instance.modelAllowlist]),
+      );
+      return providers.map((provider) =>
+        applyProviderModelAllowlist(provider, allowlists.get(provider.instanceId)),
+      );
+    });
+
     return {
-      getProviders: Ref.get(providersRef),
+      getProviders: Ref.get(providersRef).pipe(Effect.flatMap(advertiseProviders)),
       refresh: (provider?: ProviderDriverKind) =>
-        refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refresh(provider).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(advertiseProviders),
+        ),
       refreshInstance: (instanceId: ProviderInstanceId) =>
-        refreshInstance(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        refreshInstance(instanceId).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(advertiseProviders),
+        ),
       reloadSecretsAndRefresh: (instanceId?: ProviderInstanceId) =>
-        reloadSecretsAndRefresh(instanceId).pipe(Effect.catchCause(recoverRefreshFailure)),
+        reloadSecretsAndRefresh(instanceId).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(advertiseProviders),
+        ),
       applySecretAndRefresh: (reference: SecretReference, value: string) =>
-        applySecretAndRefresh(reference, value).pipe(Effect.catchCause(recoverRefreshFailure)),
+        applySecretAndRefresh(reference, value).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(advertiseProviders),
+        ),
       refreshWorkspaceSnapshot: (input) =>
-        refreshWorkspaceSnapshot(input).pipe(Effect.catchCause(recoverRefreshFailure)),
-      refreshAfterUpdate,
+        refreshWorkspaceSnapshot(input).pipe(
+          Effect.catchCause(recoverRefreshFailure),
+          Effect.flatMap(advertiseProviders),
+        ),
+      refreshAfterUpdate: (provider, instanceId) =>
+        refreshAfterUpdate(provider, instanceId).pipe(Effect.flatMap(advertiseProviders)),
       invalidateModelCaches,
       refreshModelCatalog: refreshModelCatalog().pipe(
         Effect.catchCause(recoverRefreshFailure),
         Effect.asVoid,
       ),
       getProviderMaintenanceCapabilitiesForInstance,
-      setProviderMaintenanceActionState,
+      setProviderMaintenanceActionState: (input) =>
+        setProviderMaintenanceActionState(input).pipe(Effect.flatMap(advertiseProviders)),
       get streamChanges() {
-        return Stream.fromPubSub(changesPubSub);
+        return Stream.fromPubSub(changesPubSub).pipe(Stream.mapEffect(advertiseProviders));
       },
     } satisfies ProviderRegistry["Service"];
   }),

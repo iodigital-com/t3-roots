@@ -1024,6 +1024,35 @@ it.layer(
   });
 
   describe("ProviderRegistry.layer", () => {
+    it.effect(
+      "advertises the allowlist on reads and refreshes without losing the held catalog",
+      () =>
+        Effect.gen(function* () {
+          const h = yield* makeWorkspaceRescanHarness;
+          const models = [
+            { slug: "allowed", name: "Allowed", isCustom: false, capabilities: null },
+            { slug: "blocked", name: "Blocked", isCustom: true, capabilities: null },
+          ];
+          const original = h.first.instance;
+          const provider = { ...(yield* original.snapshot.getSnapshot), models };
+          const instance = {
+            ...original,
+            modelAllowlist: ["allowed"],
+            snapshot: {
+              ...original.snapshot,
+              getSnapshot: Effect.succeed(provider),
+              refresh: Effect.succeed(provider),
+            },
+          };
+          yield* Ref.set(h.instances, [instance]);
+          const refreshed = yield* h.registry.refreshInstance(instance.instanceId);
+          expect(refreshed[0]?.models).toEqual([models[0]]);
+          expect((yield* h.registry.getProviders)[0]?.models).toEqual([models[0]]);
+          yield* Ref.set(h.instances, [{ ...instance, modelAllowlist: [] }]);
+          expect((yield* h.registry.getProviders)[0]?.models).toEqual(models);
+        }).pipe(Effect.provide(layerUnusedMutator)),
+    );
+
     it("marks folder catalogs pending when a machine refresh changes the machine models", () => {
       const machineModel = {
         slug: "opencode/big-pickle",

@@ -40,6 +40,7 @@ export type ProviderWorkspaceSnapshot = ServerProvider &
 
 export interface ProviderInstance {
   readonly instanceId: ProviderInstanceId;
+  readonly modelAllowlist?: ReadonlyArray<string> | undefined;
   readonly driverKind: ProviderDriverKind;
   readonly continuationIdentity: ProviderContinuationIdentity;
   readonly displayName: string | undefined;

@@ -75,6 +75,7 @@ import type { McpInvocationScope } from "./McpInvocationContext.ts";
 import { idleThreadProjection, liveThreadShell } from "./McpToolAccess.testkit.ts";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { resolveRuntimeMode } from "./delegatedTaskModes.ts";
+import { applyProviderModelAllowlist } from "../provider/providerModelAllowlist.ts";
 import type { ProjectionRecordFilter } from "../orchestration-v2/ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 
@@ -2489,6 +2490,44 @@ describe("OrchestratorMcpService provider resolution", () => {
         assert.equal(error.code, "orchestration_error");
         assert.equal(error.message, `${prefix}refused by the orchestrator`);
       }),
+  );
+
+  it.effect("delegation rejects a model removed by the instance allowlist", () =>
+    Effect.gen(function* () {
+      const provider = providerSnapshot({
+        instanceId: codexInstanceId,
+        driver: ProviderDriverKind.make("codex"),
+        model: "gpt-5.4",
+      });
+      const layerDependencies = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.mock(ThreadManagementService.ThreadManagementService)({
+          hasReceipt: () => Effect.succeed(false),
+          getThreadRecords: () => Effect.succeed(parentProjection([])),
+        }),
+        ServerSettings.layerTest(),
+        providerRegistryLayer([applyProviderModelAllowlist(provider, ["allowed-model"])]),
+        adapterRegistryLayer([codexInstanceId]),
+        Layer.mock(ProjectService.ProjectService)({}),
+        Layer.mock(SecretRequests.SecretRequests)({}),
+        Layer.mock(RemoteDelegation.RemoteDelegation)({}),
+        Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
+      );
+      const error = yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        return yield* service
+          .delegateTask(scope, {
+            task: "Summarize the diff.",
+            target: { providerInstanceId: codexInstanceId, model: "gpt-5.4" },
+            mode: "async",
+            clientRequestId: "delegate-disallowed-model",
+          })
+          .pipe(Effect.flip);
+      }).pipe(Effect.provide(layerOrchestratorService.pipe(Layer.provide(layerDependencies))));
+      assert.equal(error.code, "model_unavailable");
+      assert.include(error.message, "gpt-5.4 is not advertised");
+    }),
   );
 
   it.effect("an unadvertised model refusal names advertised slugs to retry with", () =>
