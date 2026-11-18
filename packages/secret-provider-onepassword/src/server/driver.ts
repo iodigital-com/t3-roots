@@ -21,16 +21,48 @@ const ONE_PASSWORD_BINARY = "op";
 // Bounds a read long enough to reach for a fingerprint reader, short enough not to wedge a rebuild.
 const READ_TIMEOUT = Duration.seconds(45);
 
+// On Windows, 1Password refuses to show its approval prompt to `op` started by the desktop app's
+// Electron backend (`promptError`), but shows it when native Node starts `op`. The bridge only
+// relays arguments, environment, output and exit code.
+const WINDOWS_BRIDGE_SCRIPT = `const { spawn } = require("node:child_process");
+const [command, ...args] = process.argv.slice(1);
+const child = spawn(command, args, { stdio: "inherit", windowsHide: true });
+child.on("error", () => process.exit(127));
+child.on("exit", (code) => process.exit(code ?? 1));`;
+
+const withWindowsBridge = Effect.fn("OnePasswordDriver.withWindowsBridge")(function* (
+  spawnCommand: { readonly command: string; readonly args: ReadonlyArray<string> },
+  environment: NodeJS.ProcessEnv | undefined,
+) {
+  const hostEnvironment = yield* HostProcess.Environment;
+  if (
+    !(yield* HostProcess.isWindows) ||
+    (environment ?? hostEnvironment).ELECTRON_RUN_AS_NODE !== "1"
+  ) {
+    return undefined;
+  }
+  const node = yield* resolveSpawnCommand(
+    "node",
+    ["-e", WINDOWS_BRIDGE_SCRIPT, "--", spawnCommand.command, ...spawnCommand.args],
+    environment ? { env: environment } : {},
+  );
+  // Without a native Node on PATH, launch `op` directly as before.
+  if (node.shell || !/^(?:[A-Za-z]:)?[\\/]/.test(node.command)) return undefined;
+  return node;
+});
+
 // `--cache=false` skips the `op daemon`, which hangs on prompts a background server cannot show.
 const runOnePassword = Effect.fn("OnePasswordDriver.runOnePassword")(function* (
   args: ReadonlyArray<string>,
   environment?: NodeJS.ProcessEnv,
 ) {
-  const spawnCommand = yield* resolveSpawnCommand(
+  const direct = yield* resolveSpawnCommand(
     ONE_PASSWORD_BINARY,
     ["--cache=false", ...args],
     environment ? { env: environment } : {},
   );
+  const spawnCommand =
+    (direct.shell ? undefined : yield* withWindowsBridge(direct, environment)) ?? direct;
   return yield* spawnAndCollect(
     ONE_PASSWORD_BINARY,
     ChildProcess.make(spawnCommand.command, spawnCommand.args, {

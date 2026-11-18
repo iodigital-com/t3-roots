@@ -37,6 +37,7 @@ type OpResult = {
 
 function fakeOp(answer: (args: ReadonlyArray<string>, environment: NodeJS.ProcessEnv) => OpResult) {
   const invocations: Array<ReadonlyArray<string>> = [];
+  const commands: Array<string> = [];
   const environments: Array<NodeJS.ProcessEnv> = [];
   const spawned = Deferred.makeUnsafe<void>();
   const layer = Layer.mergeAll(
@@ -55,6 +56,7 @@ function fakeOp(answer: (args: ReadonlyArray<string>, environment: NodeJS.Proces
               Redacted.isRedacted(value) ? Redacted.value(value) : value,
             ]),
           );
+          commands.push(command.command);
           invocations.push(args);
           environments.push(environment);
           Deferred.doneUnsafe(spawned, Effect.void);
@@ -82,7 +84,7 @@ function fakeOp(answer: (args: ReadonlyArray<string>, environment: NodeJS.Proces
     NodeFileSystem.layer,
     NodeCrypto.layer,
   );
-  return { layer, invocations, environments, spawned };
+  return { layer, invocations, commands, environments, spawned };
 }
 
 const runFrom =
@@ -378,6 +380,88 @@ describe("1Password driver", () => {
       Effect.provideService(SpawnExecutableResolution, () => undefined),
       Effect.provide(op.layer),
     );
+  });
+
+  const electronBackend = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+    resolve: (command: string) => string | undefined,
+  ) =>
+    effect.pipe(
+      Effect.provideService(HostProcess.Platform, "win32"),
+      Effect.provideService(HostProcess.Environment, { ELECTRON_RUN_AS_NODE: "1" }),
+      Effect.provideService(SpawnExecutableResolution, resolve),
+    );
+  const nativeNodeAndOp = (command: string) =>
+    command === "node" ? "C:\\runtime\\node.exe" : command === "op" ? "C:\\op\\op.exe" : undefined;
+
+  it.effect("starts op through native Node from the Windows desktop backend", () => {
+    const op = fakeOp(() => ({ stdout: "sk-live" }));
+    return Effect.gen(function* () {
+      assert.deepStrictEqual(yield* driver.read({ account }, ["op://Private/OpenAI/credential"]), [
+        "sk-live",
+      ]);
+      assert.deepStrictEqual(op.commands, ["C:\\runtime\\node.exe"]);
+      const [flag, , separator, ...forwarded] = op.invocations[0]!;
+      assert.strictEqual(flag, "-e");
+      assert.strictEqual(separator, "--");
+      assert.deepStrictEqual(forwarded, [
+        "C:\\op\\op.exe",
+        "--cache=false",
+        "read",
+        "--account=my.1password.com",
+        "--no-newline",
+        "op://Private/OpenAI/credential",
+      ]);
+    }).pipe((effect) => electronBackend(effect, nativeNodeAndOp), Effect.provide(op.layer));
+  });
+
+  it.effect("starts op directly when the desktop backend finds no native Node", () => {
+    const op = fakeOp(() => ({ stdout: "sk-live" }));
+    return Effect.gen(function* () {
+      assert.deepStrictEqual(yield* driver.read({ account }, ["op://Private/OpenAI/credential"]), [
+        "sk-live",
+      ]);
+      assert.deepStrictEqual(op.commands, ["C:\\op\\op.exe"]);
+    }).pipe(
+      (effect) =>
+        electronBackend(effect, (command) => (command === "op" ? "C:\\op\\op.exe" : undefined)),
+      Effect.provide(op.layer),
+    );
+  });
+
+  it.effect("starts op directly outside the desktop backend", () => {
+    const op = fakeOp(() => ({ stdout: "sk-live" }));
+    return Effect.gen(function* () {
+      yield* driver.read({ account }, ["op://Private/OpenAI/credential"]);
+      assert.deepStrictEqual(op.commands, ["C:\\op\\op.exe"]);
+    }).pipe(
+      Effect.provideService(HostProcess.Platform, "win32"),
+      Effect.provideService(HostProcess.Environment, {}),
+      Effect.provideService(SpawnExecutableResolution, nativeNodeAndOp),
+      Effect.provide(op.layer),
+    );
+  });
+
+  it.effect("relays arguments, environment, output and exit code through the bridge", () => {
+    const fakeOpScript =
+      "process.stdout.write(JSON.stringify([process.argv.slice(1), process.env.T3_BRIDGE_CHECK]));process.exit(3)";
+    const op = fakeOp((args, environment) => {
+      // Run the real bridge script with this Node, standing in a Node script for `op.exe`.
+      const result = NodeChildProcess.spawnSync(
+        process.execPath,
+        [args[0]!, args[1]!, "--", process.execPath, "-e", fakeOpScript, "--", ...args.slice(4)],
+        { env: { ...environment, T3_BRIDGE_CHECK: "passed" }, encoding: "utf8", windowsHide: true },
+      );
+      assert.deepStrictEqual(JSON.parse(result.stdout), [
+        ["--cache=false", "read", "--account=my.1password.com", "--no-newline", "op://P/K/c"],
+        "passed",
+      ]);
+      return { stdout: result.stdout, code: result.status ?? 1 };
+    });
+    return Effect.gen(function* () {
+      assert.deepStrictEqual(yield* driver.read({ account }, ["op://P/K/c"]), [undefined]);
+      assert.strictEqual(op.invocations.length, 1);
+    }).pipe((effect) => electronBackend(effect, nativeNodeAndOp), Effect.provide(op.layer));
   });
 
   it.effect("rejects missing, blank, and unresolved values without inherited fallback", () => {
