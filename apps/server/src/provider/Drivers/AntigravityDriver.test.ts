@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
   ANTIGRAVITY_DEFAULT_MODEL,
+  EnvironmentId,
   ProviderInstanceId,
   ProviderSessionId,
   ThreadId,
@@ -153,6 +154,10 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     credentialKeys: ReadonlyArray<string>;
     geminiApiKey: string | undefined;
     tempDirectory: string | undefined;
+    mcpEndpoint: string | undefined;
+    mcpAuthorization: string | undefined;
+    mcpNode: string | undefined;
+    threadId: string | undefined;
     handle: ChildProcessSpawner.ChildProcessHandle;
   }> = [];
 
@@ -213,6 +218,10 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
           blockedCredentialKeys.has(key.toUpperCase()),
         ),
         geminiApiKey: env("GEMINI_API_KEY"),
+        mcpEndpoint: env("T3_ACP_MCP_ENDPOINT"),
+        mcpAuthorization: env("T3_ACP_MCP_AUTHORIZATION"),
+        mcpNode: env("T3_ACP_MCP_NODE"),
+        threadId: env("T3CODE_THREAD_ID"),
         tempDirectory:
           environment.ANTIGRAVITY_HARNESS_PATH === undefined ? undefined : env("TMPDIR"),
         handle,
@@ -228,7 +237,12 @@ const makeHarness = Effect.fn("makeAntigravityDriverHarness")(function* (
     environment: [
       { name: "PATH", value: instancePath },
       { name: "T3_ACP_ANTIGRAVITY", value: "1" },
-      ...(options.manual ? [{ name: "T3_ACP_SESSION_LIFECYCLE", value: "1" }] : []),
+      ...(options.manual
+        ? [
+            { name: "T3_ACP_SESSION_LIFECYCLE", value: "1" },
+            { name: "T3_ACP_MCP_HTTP", value: "1" },
+          ]
+        : []),
       { name: "T3_ACP_REQUEST_LOG_PATH", value: requestLog },
       { name: "GEMINI_API_KEY", value: "must-not-be-used" },
       { name: "google_api_key", value: "must-not-be-used" },
@@ -313,7 +327,7 @@ const layerTest = ProviderHostLive.layer.pipe(
 
 it.layer(layerTest, { excludeTestServices: true })("Antigravity private MCP", (it) => {
   it.effect(
-    "forwards private MCP on conversational new and resumed/forked sessions while auth stays tool-free",
+    "keeps private CLI MCP native on new and resumed/forked sessions while injecting deferred T3 tools",
     () =>
       Effect.gen(function* () {
         const h = yield* makeHarness({ manual: true });
@@ -337,6 +351,16 @@ it.layer(layerTest, { excludeTestServices: true })("Antigravity private MCP", (i
         ).toEqual([[]]);
         const workspace = yield* h.fs.makeTempDirectoryScoped({ prefix: "t3-private-chat-" });
         const threadId = ThreadId.make("private-mcp-thread");
+        const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+        yield* mcpSessions.set({
+          environmentId: EnvironmentId.make("test-environment"),
+          threadId,
+          providerSessionId: "private-mcp-session",
+          providerInstanceId: h.instance.instanceId,
+          endpoint: "http://127.0.0.1:1234/mcp",
+          authorizationHeader: "Bearer fixture-session",
+          browserToolsAvailable: true,
+        });
         const modelSelection = { instanceId: h.instance.instanceId, model: "gemini-test-low" };
         const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
           runtimeMode: "approval-required",
@@ -353,13 +377,24 @@ it.layer(layerTest, { excludeTestServices: true })("Antigravity private MCP", (i
         const created = (yield* h.readRequests)
           .filter((request) => request.method === "session/new")
           .at(-1);
-        expect(created?.params?.mcpServers).toContainEqual({
-          type: "stdio",
-          name: "privateShared",
-          command: "node",
-          args: ["roots-mcp.mjs", "fixture"],
-          env: [{ name: "LANG", value: "en_GB" }],
-        });
+        const injected = [
+          {
+            type: "http",
+            name: "t3-code",
+            url: "http://127.0.0.1:1234/mcp",
+            headers: [
+              { name: "Authorization", value: "Bearer fixture-session" },
+              { name: "t3-tool-exposure", value: "deferred" },
+            ],
+          },
+        ];
+        const conversationLaunch = h.launches.at(-1);
+        expect(conversationLaunch?.mcpEndpoint).toBe("http://127.0.0.1:1234/mcp");
+        expect(conversationLaunch?.mcpAuthorization).toBe("Bearer fixture-session");
+        expect(conversationLaunch?.mcpNode).toBeTruthy();
+        expect(conversationLaunch?.threadId).toBe(threadId);
+        expect(h.launches[0]?.mcpAuthorization).toBeUndefined();
+        expect(created?.params?.mcpServers).toEqual(injected);
         const restoredSession = yield* h.instance.orchestrationAdapter.openSession({
           threadId,
           providerSessionId: ProviderSessionId.make("private-mcp-restored-session"),
@@ -372,17 +407,31 @@ it.layer(layerTest, { excludeTestServices: true })("Antigravity private MCP", (i
           modelSelection,
           runtimePolicy,
         });
+        const forkThreadId = ThreadId.make("private-mcp-fork");
+        yield* mcpSessions.set({
+          environmentId: EnvironmentId.make("test-environment"),
+          threadId: forkThreadId,
+          providerSessionId: "private-mcp-fork-session",
+          providerInstanceId: h.instance.instanceId,
+          endpoint: "http://127.0.0.1:1234/fork-mcp",
+          authorizationHeader: "Bearer fixture-fork-session",
+          browserToolsAvailable: true,
+        });
         yield* restoredSession.forkThread({
           sourceProviderThread: resumed,
-          targetThreadId: ThreadId.make("private-mcp-fork"),
+          targetThreadId: forkThreadId,
           modelSelection,
           runtimePolicy,
         });
+        expect(h.launches.at(-1)?.threadId).toBe(forkThreadId);
+        expect(h.launches.at(-1)?.mcpAuthorization).toBe("Bearer fixture-fork-session");
         yield* restoredSession.resumeThread({
           providerThread: resumed,
           modelSelection,
           runtimePolicy,
         });
+        expect(h.launches.at(-1)?.threadId).toBe(threadId);
+        expect(h.launches.at(-1)?.mcpAuthorization).toBe("Bearer fixture-session");
         const activations = (yield* h.readRequests).filter((request) =>
           ["session/load", "session/resume", "session/fork"].includes(request.method ?? ""),
         );
@@ -391,14 +440,20 @@ it.layer(layerTest, { excludeTestServices: true })("Antigravity private MCP", (i
           "session/fork",
           "session/resume",
         ]);
-        for (const request of activations)
-          expect(request.params?.mcpServers).toContainEqual({
-            type: "stdio",
-            name: "privateShared",
-            command: "node",
-            args: ["roots-mcp.mjs", "fixture"],
-            env: [{ name: "LANG", value: "en_GB" }],
-          });
+        expect(activations.map((request) => request.params?.mcpServers)).toEqual([
+          injected,
+          [
+            {
+              ...injected[0],
+              url: "http://127.0.0.1:1234/fork-mcp",
+              headers: [
+                { name: "Authorization", value: "Bearer fixture-fork-session" },
+                { name: "t3-tool-exposure", value: "deferred" },
+              ],
+            },
+          ],
+          injected,
+        ]);
         expect(yield* h.fs.readFileString(file)).toBe(text);
         expect(JSON.stringify(yield* h.readRequests)).not.toContain("must-not-be-used");
       }).pipe(Effect.scoped),

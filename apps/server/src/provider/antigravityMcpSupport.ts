@@ -180,19 +180,15 @@ type McpOptions = {
   readonly acpMcpServers?: ReadonlyArray<AcpSchema.McpServer>;
   readonly httpMcpServers?: ReadonlyArray<AcpSchema.McpServer>;
 };
-export function mergeAntigravityPrivateMcp<T extends McpOptions>(
+export function validateAntigravityPrivateMcp<T extends McpOptions>(
   options: T,
   privateServers: ReadonlyArray<AcpSchema.McpServer>,
-): T & McpOptions {
-  const append = (servers: ReadonlyArray<AcpSchema.McpServer>) => {
+): T {
+  for (const servers of [options.mcpServers, options.acpMcpServers, options.httpMcpServers]) {
+    if (servers === undefined) continue;
     const names = new Set(servers.map((server) => server.name));
     if (privateServers.some((server) => names.has(server.name))) fail("collision");
-    return [...servers, ...privateServers];
-  };
-  return {
-    ...options,
-    mcpServers: append(options.mcpServers ?? []),
-    ...(options.acpMcpServers?.length ? { acpMcpServers: append(options.acpMcpServers) } : {}),
-    ...(options.httpMcpServers?.length ? { httpMcpServers: append(options.httpMcpServers) } : {}),
-  };
+  }
+  // The CLI reads these natively; ACP injection loses its lazy tool dispatcher under a large catalog.
+  return options;
 }

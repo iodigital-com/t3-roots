@@ -6,7 +6,7 @@ import * as HostProcess from "@t3tools/shared/HostProcess";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import {
-  mergeAntigravityPrivateMcp,
+  validateAntigravityPrivateMcp,
   parseAntigravityPrivateMcp,
   readAntigravityPrivateMcp,
 } from "./antigravityMcpSupport.ts";
@@ -129,7 +129,7 @@ it.effect(
       }
     }),
 );
-it("preserves T3 device servers and private stdio in every negotiated transport and activation override", () => {
+it("keeps native private servers out of injected transports and rejects activation collisions", () => {
   const privateServers = parseAntigravityPrivateMcp(source);
   const device = { name: "t3-code", command: "node", args: ["device-bridge"], env: [] };
   const options = {
@@ -139,19 +139,20 @@ it("preserves T3 device servers and private stdio in every negotiated transport 
       { type: "http" as const, name: "t3-code", url: "https://dummy.invalid/mcp", headers: [] },
     ],
   };
-  const combined = mergeAntigravityPrivateMcp(options, privateServers);
+  const combined = validateAntigravityPrivateMcp(options, privateServers);
   for (const transport of ["mcpServers", "acpMcpServers", "httpMcpServers"] as const)
-    expect(combined[transport].map((server) => server.name)).toEqual(["t3-code", "shared"]);
+    expect(combined[transport].map((server) => server.name)).toEqual(["t3-code"]);
   expect(options.mcpServers).toEqual([device]);
-  const activation = mergeAntigravityPrivateMcp(
+  const activation = validateAntigravityPrivateMcp(
     { mcpServers: [{ ...device, args: ["replacement-device"] }] },
     privateServers,
   );
-  expect(activation.mcpServers.map((server) => server.name)).toEqual(["t3-code", "shared"]);
-  expect(
-    mergeAntigravityPrivateMcp({ mcpServers: [] }, privateServers).acpMcpServers,
-  ).toBeUndefined();
-  expect(() => mergeAntigravityPrivateMcp({ mcpServers: privateServers }, privateServers)).toThrow(
-    "conflicts",
-  );
+  expect(activation.mcpServers.map((server) => server.name)).toEqual(["t3-code"]);
+  expect(validateAntigravityPrivateMcp({ mcpServers: [] }, privateServers)).toEqual({
+    mcpServers: [],
+  });
+  for (const transport of ["mcpServers", "acpMcpServers", "httpMcpServers"] as const)
+    expect(() =>
+      validateAntigravityPrivateMcp({ [transport]: privateServers }, privateServers),
+    ).toThrow("conflicts");
 });

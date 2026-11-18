@@ -31,7 +31,10 @@ import {
   makeAntigravityTextGeneration,
 } from "../../textGeneration/AntigravityTextGeneration.ts";
 import { makeAntigravityAuth, type AntigravityAuth } from "../AntigravityAuth.ts";
-import { mergeAntigravityPrivateMcp, readAntigravityPrivateMcp } from "../antigravityMcpSupport.ts";
+import {
+  validateAntigravityPrivateMcp,
+  readAntigravityPrivateMcp,
+} from "../antigravityMcpSupport.ts";
 import * as AntigravityInstallation from "../AntigravityInstallation.ts";
 import * as AntigravityUsage from "./AntigravityUsage.ts";
 import {
@@ -282,9 +285,9 @@ export const AntigravityDriver: ProviderDriver<
               ),
             )
           : [];
-      const combine = <T extends AcpSessionRuntime.AcpSessionActivationOptions>(options: T) =>
+      const validate = <T extends AcpSessionRuntime.AcpSessionActivationOptions>(options: T) =>
         Effect.try({
-          try: () => mergeAntigravityPrivateMcp(options, privateServers),
+          try: () => validateAntigravityPrivateMcp(options, privateServers),
           catch: () =>
             new AcpErrors.AcpTransportError({
               cause: undefined,
@@ -300,7 +303,7 @@ export const AntigravityDriver: ProviderDriver<
       > =>
         options === undefined
           ? Effect.undefined
-          : combine({
+          : validate({
               ...options,
               mcpServers: options.mcpServers ?? input.mcpServers ?? [],
               ...((options.acpMcpServers ?? input.acpMcpServers) === undefined
@@ -310,7 +313,7 @@ export const AntigravityDriver: ProviderDriver<
                 ? {}
                 : { httpMcpServers: options.httpMcpServers ?? input.httpMcpServers! }),
             });
-      const runtimeInput = privateServers.length ? yield* combine(input) : input;
+      const runtimeInput = privateServers.length ? yield* validate(input) : input;
       const runtime = yield* makeAntigravityAcpRuntime({
         ...runtimeInput,
         runtimeVersion: executable.version,
@@ -320,7 +323,7 @@ export const AntigravityDriver: ProviderDriver<
           installation: executable,
           profile,
           cwd: input.cwd,
-          baseEnv: processEnvironment,
+          baseEnv: { ...processEnvironment, ...input.processEnvironment },
           auth,
           runtimeTempDirectory,
         }),
