@@ -1,108 +1,153 @@
 <p align="center">
-  <a href="https://t3.codes">
-    <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
-  </a>
+  <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
 </p>
 
-<h1 align="center">T3 Code</h1>
-
-<p align="center">The open-source control plane for coding agents.</p>
+<h1 align="center">T3-Roots</h1>
 
 <p align="center">
-  <a href="https://t3.codes/download"><strong>Download</strong></a> ·
-  <a href="https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824">iOS</a> ·
-  <a href="https://play.google.com/store/apps/details?id=com.t3tools.t3code">Android</a> ·
-  <a href="https://app.t3.codes">Web</a> ·
-  <a href="./docs/README.md">Docs</a> ·
-  <a href="https://discord.gg/jn4EGJjrvv">Discord</a>
+  A focused fork of <a href="https://github.com/pingdotgg/t3code">T3 Code</a> built to pair with <a href="https://github.com/vincentvermeire/roots">Roots</a> for 1Password-backed, multi-project gateway workflows on <strong>macOS</strong> and <strong>Windows 11</strong>.
 </p>
 
 <p align="center">
-  <a href="https://t3.codes">
-    <img src="./.github/readme/hero.webp" width="100%" alt="T3 Code on desktop with a finished Claude thread, next to the phone app asking to approve a command from Codex" />
-  </a>
+  <a href="https://github.com/vincentvermeire/t3code/releases"><strong>Releases</strong></a> ·
+  <a href="https://github.com/vincentvermeire/roots"><strong>Roots CLI</strong></a> ·
+  <a href="./docs/roots-fork.md"><strong>Fork Architecture & Patch Reference</strong></a> ·
+  <a href="./docs/README.md"><strong>Upstream T3 Code Docs</strong></a>
 </p>
 
-T3 Code runs the coding agents on your machine and gives them one fast interface. Start a thread at your desk, then approve the next step from your phone.
+---
 
-It works with Claude Code, Codex, Cursor, OpenCode, Grok Build, Antigravity, Kiro, Pi, Muse Code, fx, and any [ACP](./docs/user/providers-acp.md) agent. If an agent is set up on your computer, T3 Code can control it.
+## What problem T3-Roots solves
 
-## What you get
+[T3 Code](https://github.com/pingdotgg/t3code) is a fast, local desktop control plane that drives Claude Code, Codex, OpenCode, Antigravity (`agy`), and other coding agents in one interface.
 
-- **Your subscriptions.** T3 Code does not resell tokens. It drives the agents you are already signed in to.
-- **Every agent in one place.** Change models in the middle of a thread. Let Claude hand a task to Codex.
-- **Desktop, web, and phone.** One server, and every client shows the same threads. There are apps for iOS and Android.
-- **Remote ready.** Run agents on any machine. Connect over your local network, Tailscale, or [T3 Connect](./docs/user/remote-access.md).
-- **Git built in.** Each thread can work in its own worktree. Review the diff, then commit, push, and open a pull request with one button.
-- **Fast.** Performance is a feature here. We measure it, and we treat a dropped frame as a bug.
-- **Open.** MIT licensed. If you don't like something, fork it.
+Out of the box, upstream T3 Code assumes developers sign in to personal agent subscriptions or configure one global API key per provider. Teams routing coding agents through an enterprise model gateway with **separate API keys per project** and **strict zero-plaintext-secret policies in 1Password** run into several gaps:
 
-## Install
+1. **1Password Environments & approval fatigue:** Upstream T3 Code only reads individual `op://` vault items, cannot read **1Password Environments** (`op-env://`), prompts separately per Environment, and hits 1Password's Electron approval-dialog block on Windows desktop builds.
+2. **Cross-project billing leaks & model sprawl:** Provider API keys in T3 Code are machine-wide, background helper tasks (commit messages, thread titles, PR descriptions) can fall back to another enabled provider's key if the primary fails, and provider catalogs list upstream models that your gateway may not serve.
+3. **Antigravity (`agy`) custom gateways & private MCP tools:** Injecting large MCP tool catalogs over ACP hits Antigravity CLI's customization token budget and drops tools, while default model lists include unserved upstream models.
+4. **GitLab CLI (`glab`) token prompts:** Background merge-request checks need a cached secret-backed `GITLAB_TOKEN` rather than prompting 1Password every minute or failing silently when locked.
 
-### Desktop app
+**T3-Roots** closes those gaps with a small, maintainable set of generic patches on top of upstream T3 Code — while [**Roots CLI**](https://github.com/vincentvermeire/roots) (`roots setup`, `roots sync`, `roots run`) manages your shared instructions, skills, MCP servers, and per-project T3 provider settings from one place.
 
-[Download T3 Code](https://t3.codes/download) for macOS, Windows, or Linux. You can also use a package manager:
+---
 
-| Platform       | Command                                                              |
-| -------------- | -------------------------------------------------------------------- |
-| macOS          | `brew install --cask t3-code`                                        |
-| Windows        | `winget install T3Tools.T3Code` or `scoop install extras/t3code`     |
-| Arch Linux     | `yay -S t3code-bin`                                                  |
-| Nix            | `nix profile add github:NixOS/nixpkgs/nixos-unstable#t3code`         |
-| Debian, Ubuntu | `.deb` from [Releases](https://github.com/pingdotgg/t3code/releases) |
+## What T3-Roots adds on top of T3 Code
 
-### Command line
+Instead of adding gateway-specific logic to T3 Code, T3-Roots adds five clean, general capabilities:
 
-This installs the `t3` command. Run `t3` to start the server and open the web app.
+### 1. 1Password Environments & Single-Prompt Unlocking
 
-```bash
-curl -fsSL https://t3.codes/install.sh | sh
+- **Native `op-env://` references:** Resolves 1Password Environment variables (`op-env://<environment-id>/<VAR>`) natively alongside standard `op://` item references, without falling back to ambient environment variables when a secret is missing.
+- **Batched single-unlock reads:** Groups non-overlapping 1Password Environments and `op://` item references into a single `op run` invocation so startup unlocks everything with **one** Touch ID or Windows Hello prompt.
+- **Windows desktop native-Node prompt bridge:** On Windows 11 desktop builds (where 1Password's desktop app refuses to show approval dialogs to an Electron-as-Node parent), T3-Roots transparently relays `op` calls through native `node` when available on `PATH`.
+
+### 2. Per-Project Model Governance & Strict Cost Isolation
+
+- **Per-provider model allowlists (`modelAllowlist`):** Optional allowlist on each provider instance (populated automatically by `roots sync` from your gateway's `/v1/models`) filters both the chat model picker and subagent delegation (`delegate_task` / `orchestrator_capabilities`) to models your gateway actually serves.
+- **`selected-only` helper policy:** Enforces `textGenerationFallbackPolicy: "selected-only"` globally and per project so automatic commit messages, PR descriptions, branch names, and thread titles strictly use that project's configured helper generator and **never** silently fall back to another project's API key.
+- **Clear delegation guidance:** Updates `orchestrator_capabilities` tool documentation so coordinating agents select eligible child-task models cleanly and respect allowlist policies.
+
+### 3. Antigravity (`agy`) Gateway & Private MCP Support
+
+- **Native private stdio MCP without tool truncation:** Validates per-instance `<profile>/config/mcp_config.json` (blocking symlinks and inline secrets) while letting Antigravity CLI load private stdio MCP servers natively so its lazy MCP tool dispatcher (`call_mcp_tool`) retains full access to large toolsets (such as Jira/Confluence), alongside T3's deferred HTTP MCP tools (`tool_search`).
+- **Thread-scoped credentials across switch & fork:** Passes session fallback variables (`T3_ACP_MCP_*`) into the spawned process environment and restarts Antigravity cleanly when switching or forking threads so shell and MCP calls always carry the active thread's credentials.
+- **Gateway-only custom model picker:** When `customModels` is configured on an Antigravity provider instance, hides unlisted default models so only your gateway-served Gemini models appear.
+
+### 4. Secret-Backed GitLab (`glab`) Integration
+
+- **Cached `GITLAB_TOKEN` injection:** Adds a secret-reference-backed Access Token setting under **Settings → Source Control → GitLab**, resolves it once into server memory per session, and passes `GITLAB_TOKEN` to `glab` so background MR polling never re-triggers 1Password prompts.
+- **Actionable locked-vault errors:** Surfaces a clear recovery message when the GitLab token cannot be read from 1Password instead of invoking `glab` unauthenticated.
+
+### 5. Standalone Cross-Platform Releases (macOS & Windows 11)
+
+- **Automated draft release workflow (`release-roots.yml`):** Tagging `vX.Y.Z-roots.N` builds:
+  - **macOS Apple Silicon (`arm64`)** and **macOS Intel (`x64`)** `.dmg` and `.zip` bundles (ad-hoc signed after bytecode cache generation and launch-tested in CI, with Squirrel auto-update cleanly disabled on unsigned macOS builds).
+  - **Windows 11 (`x64`)** NSIS `.exe` installer (with packaged startup bytecode cache budget accounted for and embedded Linux x64 WSL runtime).
+  - **`SHA256SUMS`** covering all installers and archives.
+
+For commit-by-commit technical details and upstream rebase instructions, see [**docs/roots-fork.md**](./docs/roots-fork.md).
+
+---
+
+## Installation & First Run (macOS & Windows 11)
+
+### Recommended: Install with Roots CLI (`roots setup`)
+
+[Roots CLI](https://github.com/vincentvermeire/roots) downloads and SHA-256-verifies T3-Roots, installs your four coding harnesses (`claude`, `codex`, `opencode`, `agy`), configures per-project providers in T3-Roots, and syncs live gateway model allowlists:
+
+```sh
+npm install -g github:vincentvermeire/roots
+roots setup
 ```
 
-On Windows, in PowerShell:
+> **Using GitLab?** Also install the [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli#installation) on your login shell `PATH` (`brew install glab` on macOS or `winget install --id GitLab.Glab -e` on Windows 11) so T3-Roots' merge-request sidebar can query GitLab with your cached token.
 
-```powershell
-irm https://t3.codes/install.ps1 | iex
-```
+### Manual installation from GitHub Releases
 
-To try it once without an install, run `npx t3@latest`.
+Download the asset for your platform from [**Releases**](https://github.com/vincentvermeire/t3code/releases):
 
-### Phone
+| Platform                  | Asset                                   | Installation steps                                                                                          |
+| ------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **macOS (Apple Silicon)** | `T3-Code-<ver>-arm64.dmg` _(or `.zip`)_ | Open the `.dmg`, drag **T3 Code (Beta).app** to `/Applications`, then clear browser quarantine (see below). |
+| **macOS (Intel)**         | `T3-Code-<ver>-x64.dmg` _(or `.zip`)_   | Open the `.dmg`, drag **T3 Code (Beta).app** to `/Applications`, then clear browser quarantine (see below). |
+| **Windows 11 (`x64`)**    | `T3-Code-<ver>-x64.exe`                 | Run the installer. If Windows SmartScreen appears, click **More info → Run anyway**.                        |
 
-Get the app from the [App Store](https://apps.apple.com/us/app/t3-code-remote-claude-more/id6787819824) or [Google Play](https://play.google.com/store/apps/details?id=com.t3tools.t3code). Then follow [remote access](./docs/user/remote-access.md) to connect it to your computer.
+> **Note — Shared app identity & user data:** T3-Roots installs as **`T3 Code (Beta)`** using the same app name and bundle ID (`com.t3tools.t3code`) as upstream T3 Code. Installing T3-Roots replaces an existing official **`T3 Code (Beta)`** binary in `/Applications` (macOS) or `%LOCALAPPDATA%\Programs\t3code` (Windows) while sharing `~/.t3/userdata` (threads, state, and `settings.json`).
 
-### Sign in to an agent
+---
 
-T3 Code needs one agent that is installed and signed in. For example, install [Claude Code](https://claude.com/product/claude-code) and run `claude auth login`, or install [Codex CLI](https://developers.openai.com/codex/cli) and run `codex login`.
+## Platform notes
 
-[Provider setup](./docs/user/install.md#providers) has the steps for each agent. [Install T3 Code](./docs/user/install.md) covers nightly builds, AppImage, WSL, and NixOS.
+### macOS
 
-## "Wait, what are you selling me?"
+1. **Gatekeeper on manual browser downloads:**
+   T3-Roots builds are ad-hoc signed rather than signed with an Apple Developer ID certificate. If you install via `roots setup`, macOS does not add a quarantine flag. If you download `.dmg` or `.zip` through a browser, run once after copying to `/Applications`:
 
-Nothing. We built T3 Code because we wanted the best possible development experience with agents. We were inspired by existing solutions like the Codex desktop app, Conductor, Claude Desktop and Cursor Glass, but none met our bar.
+   ```sh
+   xattr -dr com.apple.quarantine "/Applications/T3 Code (Beta).app"
+   ```
 
-We wanted something performant, remote-ready, and truly open. If we ever go the wrong direction, we want you to have everything you need to fork and build the tool that you want.
+   _(Or attempt to open the app once, then approve it in **System Settings → Privacy & Security → Open Anyway**.)_
+
+2. **Quitting T3 before `roots sync` (`Cmd+Q`):**
+   On macOS, clicking the red window close button closes the window while leaving **T3 Code (Beta)** running in the Dock. Always quit with **`Cmd+Q`** before running `roots sync` so T3 does not overwrite `settings.json`.
+
+3. **1Password CLI & Touch ID:**
+   In **1Password 8 → Settings → Developer**, enable **Integrate with 1Password CLI** and install `op` (`brew install --cask 1password-cli`). Ensure `/opt/homebrew/bin` (or `/usr/local/bin`) and `~/.local/bin` are in your login shell `PATH` (`~/.zprofile` / `~/.zshrc`).
+
+4. **Updating on macOS & ad-hoc signature re-prompts:**
+   Apple's `Squirrel.Mac` auto-updater requires an Apple Developer ID certificate, so automatic in-app updates are disabled on macOS fork builds. To update, upgrade Roots first (`npm install -g github:vincentvermeire/roots`) and run `roots setup`, or download the newest `.dmg`/`.zip` from Releases. Because each ad-hoc build has a new code signature hash, macOS Keychain (_Always Allow_), 1Password CLI approval, and macOS privacy permissions may prompt once after an upgrade.
+
+### Windows 11
+
+1. **1Password CLI & Node.js on `PATH`:**
+   Install **Node.js 26 LTS** (`winget install OpenJS.NodeJS.LTS`) and **1Password CLI** (`winget install AgileBits.1Password.CLI`), and enable **Integrate with 1Password CLI** in the 1Password desktop app. Having `node` on `PATH` enables T3-Roots' Windows prompt bridge so Windows Hello approvals appear reliably.
+
+2. **Windows SmartScreen:**
+   Because the `.exe` installer is unsigned, Windows SmartScreen displays an _Unrecognized app_ banner on manual downloads — click **More info → Run anyway**.
+
+### Both platforms: First-time Antigravity (`agy`) connection
+
+After running `roots sync`, the first time you select a project's `<project> agy` provider in T3-Roots, open **Settings → Providers → `<project> agy`** and click **Connect** once so T3 loads the custom Gemini model catalog.
+
+### Switching back to official T3 Code
+
+Because T3-Roots shares the **`T3 Code (Beta)`** app identity (`com.t3tools.t3code`) and `~/.t3/userdata`, you can switch back to official upstream T3 Code without losing your threads or workspace state:
+
+- **macOS:** Quit **T3 Code (Beta)** with **`Cmd+Q`**, then reinstall the official build with Homebrew (`brew install --cask --force t3-code`) or download the official `.dmg` from [t3.codes/download](https://t3.codes/download) or [upstream Releases](https://github.com/pingdotgg/t3code/releases) and replace `/Applications/T3 Code (Beta).app`.
+- **Windows 11:** Quit **T3 Code (Beta)**, uninstall T3-Roots from **Settings → Apps → Installed apps** (which removes `%LOCALAPPDATA%\Programs\t3code` while leaving `~/.t3/userdata` intact), and reinstall official T3 Code with `winget install T3Tools.T3Code` or from [t3.codes/download](https://t3.codes/download) / [upstream Releases](https://github.com/pingdotgg/t3code/releases).
+
+If you use Roots, replace each project's `op-env://` key with an `op://` item reference and run `roots setup`, choosing **Official T3 Code**. Re-run setup with **T3-Roots fork** to return to the fork.
+
+---
 
 ## Documentation
 
-- [Install and first run](./docs/user/install.md)
-- [Remote access from a phone or another machine](./docs/user/remote-access.md)
-- [Permission modes](./docs/user/permission-modes.md)
-- [Source control](./docs/user/source-control.md)
-- [Connect outside agents over MCP](./docs/user/outside-agents.md)
-- [FAQ](./docs/user/faq.md)
-
-[All docs](./docs/README.md) has the full list.
-
-## Contributing
-
-We have limited review capacity. Small, focused fixes are the most likely to be merged. Features need an approved discussion first.
-
-- Read [CONTRIBUTING.md](./CONTRIBUTING.md) before you report a bug or open a pull request.
-- Put feature requests in [Ideas](https://github.com/pingdotgg/t3code/discussions/categories/ideas).
-- Build from source with the [development runbook](./docs/operations/development.md#first-checkout). The [architecture overview](./docs/internals/overview.md) explains how it works.
-- Get help in [Discord](https://discord.gg/jn4EGJjrvv).
+- [**T3-Roots Fork Architecture & Patch Register**](./docs/roots-fork.md)
+- [**Roots CLI Repository & Documentation**](https://github.com/vincentvermeire/roots)
+- [**Upstream T3 Code Documentation**](./docs/README.md) ([Install](./docs/user/install.md) · [Permission Modes](./docs/user/permission-modes.md) · [Source Control](./docs/user/source-control.md) · [Development Runbook](./docs/operations/development.md))
 
 ## License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) — forked from [pingdotgg/t3code](https://github.com/pingdotgg/t3code).

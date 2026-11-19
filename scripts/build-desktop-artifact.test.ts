@@ -605,7 +605,24 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
             undefined,
             undefined,
           );
-          const mac = config.mac as { extendInfo: Record<string, unknown> };
+          const mac = config.mac as {
+            extendInfo: Record<string, unknown>;
+            identity?: string;
+            hardenedRuntime?: boolean;
+            sign?: string;
+          };
+          assert.deepInclude(config.extraResources, {
+            from: "apps/desktop/resources/desktop-signing",
+            to: "desktop-signing",
+          });
+          if (signed) {
+            assert.isString(mac.sign);
+            assert.isUndefined(mac.identity);
+          } else {
+            assert.equal(mac.identity, "-");
+            assert.equal(mac.hardenedRuntime, false);
+            assert.isUndefined(mac.sign);
+          }
           for (const key of [
             "NSCalendarsUsageDescription",
             "NSCalendarsFullAccessUsageDescription",

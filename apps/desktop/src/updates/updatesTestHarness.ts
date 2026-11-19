@@ -37,6 +37,7 @@ export interface UpdatesHarnessOptions {
   readonly env?: Record<string, string | undefined>;
   readonly platform?: NodeJS.Platform;
   readonly packageType?: string | undefined;
+  readonly desktopSigning?: string | undefined;
   readonly installRecord?: string | undefined;
   readonly policy?: DesktopUpdatePolicy.UpdatePolicy;
   readonly appVersion?: string;
@@ -255,7 +256,13 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
         ? (installRecords.get(path) ?? previousInstallRecord)
         : undefined;
       if (installRecord !== undefined) return Effect.succeed(installRecord);
-      return path === "/missing/resources/package-type" && options.packageType !== undefined
+      if (/(?:^|[\\/])desktop-signing$/.test(path)) {
+        // Existing update fixtures represent a signed release; explicit undefined tests absence.
+        const signing = "desktopSigning" in options ? options.desktopSigning : "signed\n";
+        if (signing !== undefined) return Effect.succeed(signing);
+      }
+      return path.replaceAll("\\", "/") === "/missing/resources/package-type" &&
+        options.packageType !== undefined
         ? Effect.succeed(options.packageType)
         : Effect.fail(
             PlatformError.systemError({
@@ -271,7 +278,7 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
       Effect.sync(() => {
         if (isInstallRecord(path)) installRecords.set(path, data);
         else {
-          if (path.endsWith("/desktop-update-restart")) updateRestartMarkers.add(path);
+          if (/(?:^|[\\/])desktop-update-restart$/.test(path)) updateRestartMarkers.add(path);
           updateMarkerContents.set(path, data);
         }
       }),
@@ -318,7 +325,9 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
     installSteps,
     updateRestartMarkers,
     updateInProgressMarker: () =>
-      [...updateMarkerContents].find(([path]) => path.endsWith("/desktop-update-in-progress"))?.[1],
+      [...updateMarkerContents].find(([path]) =>
+        /(?:^|[\\/])desktop-update-in-progress$/.test(path),
+      )?.[1],
     installRecords,
     previousInstallRecord: () => previousInstallRecord,
     downloadCount: () => downloadCount,

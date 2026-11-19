@@ -348,10 +348,14 @@ function getAutoUpdateDisabledReason(args: {
   appImage?: string | undefined;
   isDebPackage: boolean;
   disabledByEnv: boolean;
+  isUnsignedBuild: boolean;
   hasUpdateFeedConfig: boolean;
 }): string | null {
   if (args.policy.mode === "off") {
     return args.policy.message ?? "Updates are turned off on this machine.";
+  }
+  if (args.platform === "darwin" && args.isUnsignedBuild) {
+    return "Automatic updates on macOS require an Apple-signed build. Update with roots setup or download the latest release.";
   }
   if (!args.hasUpdateFeedConfig) {
     return "Automatic updates are not available because no update feed is configured.";
@@ -471,6 +475,17 @@ export const make = Effect.gen(function* () {
     ),
   );
 
+  // Packaging resolves signing after shared bundles are built, including --skip-build.
+  const isUnsignedMacBuild =
+    environment.platform === "darwin" && environment.isPackaged
+      ? yield* fileSystem
+          .readFileString(environment.path.join(environment.resourcesPath, "desktop-signing"))
+          .pipe(
+            Effect.map((signing) => signing.trim() !== "signed"),
+            Effect.orElseSucceed(() => true),
+          )
+      : false;
+
   const resolveDisabledReason = Effect.gen(function* () {
     const hasFeedConfig = yield* hasUpdateFeedConfig;
     return Option.fromNullishOr(
@@ -482,6 +497,7 @@ export const make = Effect.gen(function* () {
         appImage: Option.getOrUndefined(config.appImagePath),
         isDebPackage,
         disabledByEnv: config.disableAutoUpdate,
+        isUnsignedBuild: isUnsignedMacBuild || config.unsignedDesktopBuild,
         hasUpdateFeedConfig: hasFeedConfig,
       }),
     );

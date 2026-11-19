@@ -105,6 +105,51 @@ describe("DesktopUpdates", () => {
     }),
   );
 
+  it.effect(
+    "disables automatic updates on unsigned macOS builds while keeping Windows enabled",
+    () =>
+      Effect.gen(function* () {
+        const checkPlatform = (platform: "darwin" | "win32", desktopSigning?: string) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const updates = yield* DesktopUpdates.DesktopUpdates;
+              const desktopState = yield* DesktopState.DesktopState;
+              yield* updates.configure;
+              return {
+                state: yield* updates.getState,
+                canInstallUpdates: yield* Ref.get(desktopState.canInstallUpdates),
+              };
+            }),
+          ).pipe(
+            Effect.provide(
+              makeHarness({
+                platform,
+                desktopSigning,
+              }).layer,
+            ),
+          );
+
+        const mac = yield* checkPlatform("darwin", "unsigned\n");
+        assert.equal(mac.state.status, "disabled");
+        assert.isFalse(mac.canInstallUpdates);
+        assert.match(mac.state.message ?? "", /Apple-signed build/);
+
+        const signed = yield* checkPlatform("darwin", "signed\n");
+        assert.equal(signed.state.status, "idle");
+        assert.isTrue(signed.canInstallUpdates);
+
+        const unmarked = yield* checkPlatform("darwin");
+        assert.equal(unmarked.state.status, "disabled");
+
+        const invalid = yield* checkPlatform("darwin", "unknown");
+        assert.equal(invalid.state.status, "disabled");
+
+        const win = yield* checkPlatform("win32");
+        assert.equal(win.state.status, "idle");
+        assert.isTrue(win.canInstallUpdates);
+      }),
+  );
+
   it.effect("keeps the disabled reason available after configuration and channel changes", () => {
     const harness = makeHarness({ env: { T3CODE_DISABLE_AUTO_UPDATE: "true" } });
     const reason = "Automatic updates are disabled by the T3CODE_DISABLE_AUTO_UPDATE setting.";

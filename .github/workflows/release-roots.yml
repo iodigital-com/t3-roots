@@ -1,5 +1,5 @@
-# Builds an unsigned Windows x64 installer and saves a draft fork release.
-# Start by pushing a tag such as v0.1.10-roots.1 on the patched commit.
+# Builds unsigned Windows x64 and ad-hoc signed macOS (arm64 + x64) installers into a draft fork release.
+# Start by pushing a tag such as v0.1.10-roots.7 on the patched commit.
 # Publishing the resulting draft needs Vincent's OK for that exact release.
 name: Roots release
 
@@ -118,14 +118,9 @@ jobs:
     if: github.repository == 'vincentvermeire/t3code'
     runs-on: windows-2025
     timeout-minutes: 90
-    permissions:
-      contents: write
     env:
       RELEASE_VERSION: ${{ needs.cli.outputs.version }}
     steps:
-      # The repo is public, so git needs no credentials. actions/checkout's credential
-      # cleanup runs `git submodule foreach`, which fails on the orphaned gitlinks in
-      # the vendored .repos tree, so fetch with plain git (as upstream's release does).
       - name: Checkout
         shell: bash
         env:
@@ -190,14 +185,192 @@ jobs:
             --build-version "$RELEASE_VERSION" --skip-build --verbose \
             --wsl-runtime "release-cli/t3-$RELEASE_VERSION-linux-x64.tar.gz" --output-dir release
 
-      - name: Collect and validate release assets
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: roots-desktop-win-x64
+          path: |
+            release/T3-Code-${{ needs.cli.outputs.version }}-x64.exe
+            release/T3-Code-${{ needs.cli.outputs.version }}-x64.exe.blockmap
+            release/latest.yml
+          if-no-files-found: error
+          compression-level: 0
+
+  mac_arm64:
+    needs: cli
+    if: github.repository == 'vincentvermeire/t3code'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ needs.cli.outputs.version }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
-          mkdir -p release-assets
-          cp "release/T3-Code-$RELEASE_VERSION-x64.exe" "release/T3-Code-$RELEASE_VERSION-x64.exe.blockmap" \
-            release/latest.yml "release-cli/t3-$RELEASE_VERSION-linux-x64.tar.gz" release-assets/
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-js-bundle
+          path: apps
+
+      - name: Build ad-hoc signed macOS arm64 DMG and ZIP
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "$RELEASE_VERSION"
+          node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch arm64 \
+            --build-version "$RELEASE_VERSION" --skip-build --verbose --output-dir release
+
+      - name: Verify ad-hoc code signature and launch packaged app
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/desktop-launch-dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Code-$RELEASE_VERSION-arm64.dmg"
+          trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
+          app=$(ls -d "$mount"/*.app)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
+          node scripts/smoke-desktop-app.ts --artifacts-dir "$RUNNER_TEMP/desktop-launch-check" --executable "$app/Contents/MacOS/$executable"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: roots-desktop-mac-arm64
+          path: |
+            release/T3-Code-${{ needs.cli.outputs.version }}-arm64.dmg
+            release/T3-Code-${{ needs.cli.outputs.version }}-arm64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  mac_x64:
+    needs: cli
+    if: github.repository == 'vincentvermeire/t3code'
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: ${{ needs.cli.outputs.version }}
+    steps:
+      - name: Checkout
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git -c checkout.workers=0 checkout --detach FETCH_HEAD
+
+      - name: Ensure Rosetta for macOS x64 bytecode generation and launch check
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -m)" == "arm64" ]] && ! /usr/bin/arch -x86_64 /usr/bin/true; then
+            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
+          fi
+
+      - uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Ensure Electron runtime is installed
+        run: vp run --filter @t3tools/desktop ensure:electron
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-js-bundle
+          path: apps
+
+      - name: Build ad-hoc signed macOS x64 DMG and ZIP
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "$RELEASE_VERSION"
+          node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch x64 \
+            --build-version "$RELEASE_VERSION" --skip-build --verbose --output-dir release
+
+      - name: Verify ad-hoc code signature and launch packaged app
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/desktop-launch-dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Code-$RELEASE_VERSION-x64.dmg"
+          trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
+          app=$(ls -d "$mount"/*.app)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          executable=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$app/Contents/Info.plist")
+          node scripts/smoke-desktop-app.ts --artifacts-dir "$RUNNER_TEMP/desktop-launch-check" --executable "$app/Contents/MacOS/$executable"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: roots-desktop-mac-x64
+          path: |
+            release/T3-Code-${{ needs.cli.outputs.version }}-x64.dmg
+            release/T3-Code-${{ needs.cli.outputs.version }}-x64.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [cli, windows, mac_arm64, mac_x64]
+    if: github.repository == 'vincentvermeire/t3code'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ needs.cli.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-cli-linux-x64
+          path: release-assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-desktop-win-x64
+          path: release-assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-desktop-mac-arm64
+          path: release-assets
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: roots-desktop-mac-x64
+          path: release-assets
+
+      - name: Generate and validate SHA256SUMS
+        run: |
+          set -euo pipefail
           cd release-assets
-          sha256sum "T3-Code-$RELEASE_VERSION-x64.exe" "t3-$RELEASE_VERSION-linux-x64.tar.gz" > SHA256SUMS
+          sha256sum \
+            "T3-Code-$RELEASE_VERSION-x64.exe" \
+            "T3-Code-$RELEASE_VERSION-arm64.dmg" \
+            "T3-Code-$RELEASE_VERSION-arm64.zip" \
+            "T3-Code-$RELEASE_VERSION-x64.dmg" \
+            "T3-Code-$RELEASE_VERSION-x64.zip" \
+            "t3-$RELEASE_VERSION-linux-x64.tar.gz" > SHA256SUMS
           sha256sum --check SHA256SUMS
 
       - name: Refuse to modify an already published release
@@ -220,7 +393,7 @@ jobs:
             Based on upstream tag ${{ needs.cli.outputs.upstream_tag }}.
             Fork commit ${{ needs.cli.outputs.commit }}.
 
-            Unsigned Windows x64 installer. Publishing this draft needs Vincent's OK.
+            Unsigned Windows x64 installer and ad-hoc signed macOS (arm64 + x64) DMG/ZIP archives. Publishing this draft needs Vincent's OK.
           draft: true
           prerelease: false
           make_latest: false
