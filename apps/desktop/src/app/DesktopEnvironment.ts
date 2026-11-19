@@ -103,10 +103,12 @@ export function resolveDesktopAppBranding(input: {
   readonly appVersion: string;
 }): DesktopAppBranding {
   const stageLabel = resolveDesktopAppStageLabel(input);
+  const baseName = input.appVersion.includes("-roots.") ? "T3 Roots" : APP_BASE_NAME;
   return {
-    baseName: APP_BASE_NAME,
+    baseName,
     stageLabel,
-    displayName: `${APP_BASE_NAME} (${stageLabel})`,
+    displayName:
+      baseName === "T3 Roots" && !input.isDevelopment ? baseName : `${baseName} (${stageLabel})`,
   };
 }
 

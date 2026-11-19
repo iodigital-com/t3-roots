@@ -554,6 +554,49 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     ),
   );
 
+  it.effect(
+    "renames Roots artifacts while preserving the Windows install and protocol identities",
+    () =>
+      Effect.gen(function* () {
+        const roots = yield* createBuildConfig(
+          "win",
+          "nsis",
+          "0.1.10-roots.8",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        const prior = yield* createBuildConfig(
+          "win",
+          "nsis",
+          "0.1.10",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        assert.equal(roots.productName, "T3 Roots");
+        assert.equal(roots.artifactName, "T3-Roots-${version}-${arch}.${ext}");
+        assert.equal(roots.appId, prior.appId);
+        assert.deepEqual(roots.nsis, prior.nsis);
+        assert.equal(prior.productName, "T3 Code (Beta)");
+        assert.equal(prior.artifactName, "T3-Code-${version}-${arch}.${ext}");
+        const mac = yield* createBuildConfig(
+          "mac",
+          "dmg",
+          "0.1.10-roots.8",
+          false,
+          false,
+          undefined,
+          undefined,
+        );
+        assert.equal(mac.productName, "T3 Roots");
+        assert.nestedPropertyVal(mac, "mac.protocols.0.schemes.0", "t3code");
+        assert.nestedPropertyVal(mac, "mac.identity", "-");
+      }),
+  );
+
   it.effect("names the Electron window class in the Linux desktop entry", () =>
     Effect.gen(function* () {
       const linux = yield* createBuildConfig(

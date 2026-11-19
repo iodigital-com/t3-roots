@@ -100,6 +100,27 @@ releaseDate: '2026-03-07T10:36:07.540Z'
     );
   });
 
+  it("keeps renamed Roots installer paths in latest.yml", () => {
+    const source = `version: 0.1.10-roots.8
+files:
+  - url: T3-Roots-0.1.10-roots.8-x64.exe
+    sha512: exesha
+    size: 1
+path: T3-Roots-0.1.10-roots.8-x64.exe
+sha512: exesha
+releaseDate: '2026-11-19T15:00:00.000Z'
+`;
+    const parsed = parsePlatformUpdateManifest("win", source, "latest.yml");
+    const roundTrip = parsePlatformUpdateManifest(
+      "win",
+      serializePlatformUpdateManifest("win", parsed),
+      "latest.yml",
+    );
+    assert.equal(roundTrip.version, "0.1.10-roots.8");
+    assert.equal(roundTrip.files[0]?.url, "T3-Roots-0.1.10-roots.8-x64.exe");
+    assert.deepEqual(roundTrip.files, parsed.files);
+  });
+
   it("preserves quoted scalars as strings", () => {
     const manifest = parsePlatformUpdateManifest(
       "mac",

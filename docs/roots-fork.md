@@ -60,6 +60,8 @@ Base tag on current branch (`roots/nightly-20261116`): `v0.1.10-nightly.20261116
 ## Releasing a new fork build
 
 1. Ensure formatting, linting, typechecks, and tests pass, and verify compatibility with Roots CLI's T3 settings tests (`roots/test/t3.test.mjs`).
-2. Commit and push the branch to `vincentvermeire/t3code`, then push a signed version tag matching `vX.Y.Z-roots.N` (for example `v0.1.10-roots.7`).
+2. Commit and push the branch to `vincentvermeire/t3code`, then push a signed version tag matching `vX.Y.Z-roots.N` (for example `v0.1.10-roots.8`).
 3. GitHub Actions (`release-roots.yml`) builds all platforms, runs `codesign` and launch smoke checks on macOS plus CLI smoke checks on Linux, validates `SHA256SUMS`, and creates a **draft** GitHub Release.
-4. Review the draft release assets and `SHA256SUMS`, copy the three installer/archive SHA-256 digests (`T3-Code-<ver>-arm64.zip`, `T3-Code-<ver>-x64.zip`, `T3-Code-<ver>-x64.exe`) into `t3Fork.sha256` in `roots` (`src/defaults.mjs`) alongside bumping `t3Fork.tag`, and — only when ready — publish the GitHub Release by hand with **"Set as the latest release"** ticked so the Windows NSIS in-app updater (which queries GitHub's latest release for `latest.yml`) discovers the new version.
+4. Review the draft release assets and `SHA256SUMS`, copy the three installer/archive SHA-256 digests (`T3-Roots-<ver>-arm64.zip`, `T3-Roots-<ver>-x64.zip`, `T3-Roots-<ver>-x64.exe`) into `t3Fork.sha256` in `roots` (`src/defaults.mjs`) alongside bumping `t3Fork.tag`, and — only when ready — publish the GitHub Release by hand with **"Set as the latest release"** ticked so the Windows NSIS in-app updater (which queries GitHub's latest release for `latest.yml`) discovers the new version.
+
+From `v0.1.10-roots.8`, the desktop product is **T3 Roots** and fork assets use `T3-Roots-`. Keep the package name, app ID, protocol schemes and NSIS install identity unchanged. Windows update metadata stays `latest.yml` with the renamed `.exe` and `.blockmap` paths; the existing updater reads those paths from the manifest. Unsigned macOS builds still update through Roots or manual installation.

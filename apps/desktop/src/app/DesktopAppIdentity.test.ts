@@ -176,6 +176,26 @@ describe("DesktopAppIdentity", () => {
     ),
   );
 
+  it.effect("uses T3 Roots in the native app and About panel without moving user data", () => {
+    const calls: ElectronAppCalls = { setAboutPanelOptions: [], setDockIcon: [], setName: [] };
+    return withIdentity(
+      Effect.gen(function* () {
+        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
+        yield* identity.configure;
+        assert.deepEqual(calls.setName, ["T3 Roots"]);
+        assert.equal(calls.setAboutPanelOptions[0]?.applicationName, "T3 Roots");
+        assert.equal(
+          yield* identity.resolveUserDataPath,
+          "/Users/alice/Library/Application Support/t3code-v2",
+        );
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        assert.equal(environment.stateDir, "/Users/alice/.t3/userdata");
+        assert.equal(environment.appUserModelId, "com.t3tools.t3code");
+      }),
+      { calls, environment: { appVersion: "0.1.10-roots.8" } },
+    );
+  });
+
   it.effect.each([
     { stage: "Beta", environment: {} },
     {

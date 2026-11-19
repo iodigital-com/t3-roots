@@ -4,6 +4,7 @@ import type { SettingsWindow } from "./MacSettingsWindow.ts";
 
 const mocks = vi.hoisted(() => ({
   granted: false,
+  executable: "/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code",
   createFromPath: vi.fn(),
   startDrag: vi.fn(),
   showItemInFolder: vi.fn(),
@@ -59,7 +60,7 @@ vi.mock("electron", async () => {
   }
   return {
     app: {
-      getPath: () => "/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code",
+      getPath: () => mocks.executable,
     },
     nativeImage: { createFromPath: mocks.createFromPath },
     BrowserWindow: class extends MockWindow {},
@@ -92,6 +93,7 @@ vi.mock("./MacSettingsWindow.ts", async (importOriginal) => {
 });
 let helper: MacPermissionHelper;
 beforeEach(() => {
+  mocks.executable = "/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code";
   vi.useFakeTimers();
   vi.clearAllMocks();
   mocks.granted = false;
@@ -122,4 +124,14 @@ it("does not reopen a superseded helper when its initial probe completes", async
   await first;
   expect(windows).toHaveLength(1);
   expect(windows[0]!.destroyed).toBe(false);
+});
+
+it("names and drags the renamed Roots bundle in the macOS permission helper", async () => {
+  mocks.executable = "/Applications/T3 Roots.app/Contents/MacOS/T3 Roots";
+  const helper = new MacPermissionHelper();
+  await helper.show("accessibility", "/bundle/mac-permission-preload.cjs", null, iconPaths);
+  const html = decodeURIComponent(mocks.loadURL.mock.calls[0]![0]);
+  expect(html).toContain("Drag T3 Roots into the list above");
+  expect(html).toContain('draggable="false">T3 Roots</button>');
+  helper.close();
 });

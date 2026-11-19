@@ -1,5 +1,5 @@
 # Builds unsigned Windows x64 and ad-hoc signed macOS (arm64 + x64) installers into a draft fork release.
-# Start by pushing a tag such as v0.1.10-roots.7 on the patched commit.
+# Start by pushing a tag such as v0.1.10-roots.8 on the patched commit.
 # Publishing the resulting draft needs Vincent's OK for that exact release.
 name: Roots release
 
@@ -189,8 +189,8 @@ jobs:
         with:
           name: roots-desktop-win-x64
           path: |
-            release/T3-Code-${{ needs.cli.outputs.version }}-x64.exe
-            release/T3-Code-${{ needs.cli.outputs.version }}-x64.exe.blockmap
+            release/T3-Roots-${{ needs.cli.outputs.version }}-x64.exe
+            release/T3-Roots-${{ needs.cli.outputs.version }}-x64.exe.blockmap
             release/latest.yml
           if-no-files-found: error
           compression-level: 0
@@ -243,7 +243,7 @@ jobs:
         run: |
           set -euo pipefail
           mount="$RUNNER_TEMP/desktop-launch-dmg"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Code-$RELEASE_VERSION-arm64.dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Roots-$RELEASE_VERSION-arm64.dmg"
           trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
           app=$(ls -d "$mount"/*.app)
           codesign --verify --deep --strict --verbose=2 "$app"
@@ -254,15 +254,15 @@ jobs:
         with:
           name: roots-desktop-mac-arm64
           path: |
-            release/T3-Code-${{ needs.cli.outputs.version }}-arm64.dmg
-            release/T3-Code-${{ needs.cli.outputs.version }}-arm64.zip
+            release/T3-Roots-${{ needs.cli.outputs.version }}-arm64.dmg
+            release/T3-Roots-${{ needs.cli.outputs.version }}-arm64.zip
           if-no-files-found: error
           compression-level: 0
 
   mac_x64:
     needs: cli
     if: github.repository == 'vincentvermeire/t3code'
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 90
     env:
       RELEASE_VERSION: ${{ needs.cli.outputs.version }}
@@ -278,13 +278,6 @@ jobs:
           git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
-
-      - name: Ensure Rosetta for macOS x64 bytecode generation and launch check
-        run: |
-          set -euo pipefail
-          if [[ "$(uname -m)" == "arm64" ]] && ! /usr/bin/arch -x86_64 /usr/bin/true; then
-            sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
-          fi
 
       - uses: ./.github/actions/setup-ci-deps
         with:
@@ -314,7 +307,7 @@ jobs:
         run: |
           set -euo pipefail
           mount="$RUNNER_TEMP/desktop-launch-dmg"
-          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Code-$RELEASE_VERSION-x64.dmg"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" "release/T3-Roots-$RELEASE_VERSION-x64.dmg"
           trap 'hdiutil detach "$mount" -force >/dev/null || true' EXIT
           app=$(ls -d "$mount"/*.app)
           codesign --verify --deep --strict --verbose=2 "$app"
@@ -325,8 +318,8 @@ jobs:
         with:
           name: roots-desktop-mac-x64
           path: |
-            release/T3-Code-${{ needs.cli.outputs.version }}-x64.dmg
-            release/T3-Code-${{ needs.cli.outputs.version }}-x64.zip
+            release/T3-Roots-${{ needs.cli.outputs.version }}-x64.dmg
+            release/T3-Roots-${{ needs.cli.outputs.version }}-x64.zip
           if-no-files-found: error
           compression-level: 0
 
@@ -365,11 +358,11 @@ jobs:
           set -euo pipefail
           cd release-assets
           sha256sum \
-            "T3-Code-$RELEASE_VERSION-x64.exe" \
-            "T3-Code-$RELEASE_VERSION-arm64.dmg" \
-            "T3-Code-$RELEASE_VERSION-arm64.zip" \
-            "T3-Code-$RELEASE_VERSION-x64.dmg" \
-            "T3-Code-$RELEASE_VERSION-x64.zip" \
+            "T3-Roots-$RELEASE_VERSION-x64.exe" \
+            "T3-Roots-$RELEASE_VERSION-arm64.dmg" \
+            "T3-Roots-$RELEASE_VERSION-arm64.zip" \
+            "T3-Roots-$RELEASE_VERSION-x64.dmg" \
+            "T3-Roots-$RELEASE_VERSION-x64.zip" \
             "t3-$RELEASE_VERSION-linux-x64.tar.gz" > SHA256SUMS
           sha256sum --check SHA256SUMS
 
@@ -388,7 +381,7 @@ jobs:
           repository: vincentvermeire/t3code
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ needs.cli.outputs.commit }}
-          name: T3 Code ${{ github.ref_name }}
+          name: T3 Roots ${{ github.ref_name }}
           body: |
             Based on upstream tag ${{ needs.cli.outputs.upstream_tag }}.
             Fork commit ${{ needs.cli.outputs.commit }}.

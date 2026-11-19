@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Code logo" />
+  <img src="./assets/prod/t3-black-web-icon-192x192.png" width="80" height="80" alt="T3 Roots logo" />
 </p>
 
 <h1 align="center">T3-Roots</h1>
@@ -87,13 +87,15 @@ roots setup
 
 Download the asset for your platform from [**Releases**](https://github.com/vincentvermeire/t3code/releases):
 
-| Platform                  | Asset                                   | Installation steps                                                                                          |
-| ------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **macOS (Apple Silicon)** | `T3-Code-<ver>-arm64.dmg` _(or `.zip`)_ | Open the `.dmg`, drag **T3 Code (Beta).app** to `/Applications`, then clear browser quarantine (see below). |
-| **macOS (Intel)**         | `T3-Code-<ver>-x64.dmg` _(or `.zip`)_   | Open the `.dmg`, drag **T3 Code (Beta).app** to `/Applications`, then clear browser quarantine (see below). |
-| **Windows 11 (`x64`)**    | `T3-Code-<ver>-x64.exe`                 | Run the installer. If Windows SmartScreen appears, click **More info → Run anyway**.                        |
+| Platform                  | Asset                                    | Installation steps                                                                                    |
+| ------------------------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| **macOS (Apple Silicon)** | `T3-Roots-<ver>-arm64.dmg` _(or `.zip`)_ | Open the `.dmg`, drag **T3 Roots.app** to `/Applications`, then clear browser quarantine (see below). |
+| **macOS (Intel)**         | `T3-Roots-<ver>-x64.dmg` _(or `.zip`)_   | Open the `.dmg`, drag **T3 Roots.app** to `/Applications`, then clear browser quarantine (see below). |
+| **Windows 11 (`x64`)**    | `T3-Roots-<ver>-x64.exe`                 | Run the installer. If Windows SmartScreen appears, click **More info → Run anyway**.                  |
 
-> **Note — Shared app identity & user data:** T3-Roots installs as **`T3 Code (Beta)`** using the same app name and bundle ID (`com.t3tools.t3code`) as upstream T3 Code. Installing T3-Roots replaces an existing official **`T3 Code (Beta)`** binary in `/Applications` (macOS) or `%LOCALAPPDATA%\Programs\t3code` (Windows) while sharing `~/.t3/userdata` (threads, state, and `settings.json`).
+> **App name and upgrades:** From `v0.1.10-roots.8`, the desktop app displays as **T3 Roots**. Its bundle ID (`com.t3tools.t3code`), protocols, Windows install identity (`%LOCALAPPDATA%\Programs\t3code`), and `~/.t3/userdata` stay the same. `roots setup` migrates the old macOS bundle to `T3 Roots.app` in the same Applications folder. For manual installation, quit the old app and replace its bundle with `T3 Roots.app`; keep only one T3 bundle in Applications.
+>
+> **Mac upgrades:** You may need to re-enter saved remote connections and their secrets after the rename because macOS encrypted storage follows the app name. Re-add T3 Roots to the Dock and Login Items if you used the old app there.
 
 ---
 
@@ -105,13 +107,13 @@ Download the asset for your platform from [**Releases**](https://github.com/vinc
    T3-Roots builds are ad-hoc signed rather than signed with an Apple Developer ID certificate. If you install via `roots setup`, macOS does not add a quarantine flag. If you download `.dmg` or `.zip` through a browser, run once after copying to `/Applications`:
 
    ```sh
-   xattr -dr com.apple.quarantine "/Applications/T3 Code (Beta).app"
+   xattr -dr com.apple.quarantine "/Applications/T3 Roots.app"
    ```
 
    _(Or attempt to open the app once, then approve it in **System Settings → Privacy & Security → Open Anyway**.)_
 
 2. **Quitting T3 before `roots sync` (`Cmd+Q`):**
-   On macOS, clicking the red window close button closes the window while leaving **T3 Code (Beta)** running in the Dock. Always quit with **`Cmd+Q`** before running `roots sync` so T3 does not overwrite `settings.json`.
+   On macOS, clicking the red window close button closes the window while leaving **T3 Roots** running in the Dock. Always quit with **`Cmd+Q`** before running `roots sync` so T3 does not overwrite `settings.json`.
 
 3. **1Password CLI & Touch ID:**
    In **1Password 8 → Settings → Developer**, enable **Integrate with 1Password CLI** and install `op` (`brew install --cask 1password-cli`). Ensure `/opt/homebrew/bin` (or `/usr/local/bin`) and `~/.local/bin` are in your login shell `PATH` (`~/.zprofile` / `~/.zshrc`).
@@ -133,10 +135,10 @@ After running `roots sync`, the first time you select a project's `<project> agy
 
 ### Switching back to official T3 Code
 
-Because T3-Roots shares the **`T3 Code (Beta)`** app identity (`com.t3tools.t3code`) and `~/.t3/userdata`, you can switch back to official upstream T3 Code without losing your threads or workspace state:
+Because T3 Roots preserves the app identity (`com.t3tools.t3code`) and `~/.t3/userdata`, you can switch back to official upstream T3 Code without losing your threads or workspace state:
 
-- **macOS:** Quit **T3 Code (Beta)** with **`Cmd+Q`**, then reinstall the official build with Homebrew (`brew install --cask --force t3-code`) or download the official `.dmg` from [t3.codes/download](https://t3.codes/download) or [upstream Releases](https://github.com/pingdotgg/t3code/releases) and replace `/Applications/T3 Code (Beta).app`.
-- **Windows 11:** Quit **T3 Code (Beta)**, uninstall T3-Roots from **Settings → Apps → Installed apps** (which removes `%LOCALAPPDATA%\Programs\t3code` while leaving `~/.t3/userdata` intact), and reinstall official T3 Code with `winget install T3Tools.T3Code` or from [t3.codes/download](https://t3.codes/download) / [upstream Releases](https://github.com/pingdotgg/t3code/releases).
+- **macOS:** Quit **T3 Roots** with **`Cmd+Q`**, move `T3 Roots.app` out of Applications (keep `~/.t3/userdata`), then reinstall the official build with Homebrew (`brew install --cask --force t3-code`) or download the official `.dmg` from [t3.codes/download](https://t3.codes/download) or [upstream Releases](https://github.com/pingdotgg/t3code/releases) and replace `/Applications/T3 Code (Beta).app`.
+- **Windows 11:** Quit **T3 Roots**, uninstall T3-Roots from **Settings → Apps → Installed apps** (which removes `%LOCALAPPDATA%\Programs\t3code` while leaving `~/.t3/userdata` intact), and reinstall official T3 Code with `winget install T3Tools.T3Code` or from [t3.codes/download](https://t3.codes/download) / [upstream Releases](https://github.com/pingdotgg/t3code/releases).
 
 If you use Roots, replace each project's `op-env://` key with an `op://` item reference and run `roots setup`, choosing **Official T3 Code**. Re-run setup with **T3-Roots fork** to return to the fork.
 
