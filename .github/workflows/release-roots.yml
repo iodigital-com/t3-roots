@@ -21,12 +21,12 @@ defaults:
 
 env:
   T3CODE_TELEMETRY_CHANNEL: dev
-  T3CODE_DESKTOP_UPDATE_REPOSITORY: vincentvermeire/t3code
+  T3CODE_DESKTOP_UPDATE_REPOSITORY: vincentvermeire/t3-roots
   T3CODE_DESKTOP_SIGNED: "false"
 
 jobs:
   cli:
-    if: github.repository == 'vincentvermeire/t3code'
+    if: github.repository == 'vincentvermeire/t3-roots'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -115,7 +115,7 @@ jobs:
 
   windows:
     needs: cli
-    if: github.repository == 'vincentvermeire/t3code'
+    if: github.repository == 'vincentvermeire/t3-roots'
     runs-on: windows-2025
     timeout-minutes: 90
     env:
@@ -197,7 +197,7 @@ jobs:
 
   mac_arm64:
     needs: cli
-    if: github.repository == 'vincentvermeire/t3code'
+    if: github.repository == 'vincentvermeire/t3-roots'
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -261,7 +261,7 @@ jobs:
 
   mac_x64:
     needs: cli
-    if: github.repository == 'vincentvermeire/t3code'
+    if: github.repository == 'vincentvermeire/t3-roots'
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
@@ -325,7 +325,7 @@ jobs:
 
   release:
     needs: [cli, windows, mac_arm64, mac_x64]
-    if: github.repository == 'vincentvermeire/t3code'
+    if: github.repository == 'vincentvermeire/t3-roots'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -372,13 +372,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          published=$(gh api repos/vincentvermeire/t3code/releases --paginate --jq '.[] | select(.tag_name == env.RELEASE_TAG and .draft == false) | .id')
+          published=$(gh api repos/vincentvermeire/t3-roots/releases --paginate --jq '.[] | select(.tag_name == env.RELEASE_TAG and .draft == false) | .id')
           [[ -z "$published" ]] || { echo 'This tag already has a published release.' >&2; exit 1; }
 
       - name: Save draft release
         uses: softprops/action-gh-release@40c2ca6ddd77ba2a30bbea8f67409c0f76868d67 # v3
         with:
-          repository: vincentvermeire/t3code
+          repository: vincentvermeire/t3-roots
           tag_name: ${{ github.ref_name }}
           target_commitish: ${{ needs.cli.outputs.commit }}
           name: T3 Roots ${{ github.ref_name }}

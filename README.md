@@ -5,12 +5,12 @@
 <h1 align="center">T3-Roots</h1>
 
 <p align="center">
-  A focused fork of <a href="https://github.com/pingdotgg/t3code">T3 Code</a> built to pair with <a href="https://github.com/vincentvermeire/roots">Roots</a> for 1Password-backed, multi-project gateway workflows on <strong>macOS</strong> and <strong>Windows 11</strong>.
+  A focused fork of <a href="https://github.com/pingdotgg/t3code">T3 Code</a> built to pair with <a href="https://github.com/vincentvermeire/roots-cli">Roots</a> for 1Password-backed, multi-project gateway workflows on <strong>macOS</strong> and <strong>Windows 11</strong>.
 </p>
 
 <p align="center">
   <a href="https://github.com/vincentvermeire/t3code/releases"><strong>Releases</strong></a> ·
-  <a href="https://github.com/vincentvermeire/roots"><strong>Roots CLI</strong></a> ·
+  <a href="https://github.com/vincentvermeire/roots-cli"><strong>Roots CLI</strong></a> ·
   <a href="./docs/roots-fork.md"><strong>Fork Architecture & Patch Reference</strong></a> ·
   <a href="./docs/README.md"><strong>Upstream T3 Code Docs</strong></a>
 </p>
@@ -28,7 +28,7 @@ Out of the box, upstream T3 Code assumes developers sign in to personal agent su
 3. **Antigravity (`agy`) custom gateways & private MCP tools:** Injecting large MCP tool catalogs over ACP hits Antigravity CLI's customization token budget and drops tools, while default model lists include unserved upstream models.
 4. **GitLab CLI (`glab`) token prompts:** Background merge-request checks need a cached secret-backed `GITLAB_TOKEN` rather than prompting 1Password every minute or failing silently when locked.
 
-**T3-Roots** closes those gaps with a small, maintainable set of generic patches on top of upstream T3 Code — while [**Roots CLI**](https://github.com/vincentvermeire/roots) (`roots setup`, `roots sync`, `roots run`) manages your shared instructions, skills, MCP servers, and per-project T3 provider settings from one place.
+**T3-Roots** closes those gaps with a small, maintainable set of generic patches on top of upstream T3 Code — while [**Roots CLI**](https://github.com/vincentvermeire/roots-cli) (`roots setup`, `roots sync`, `roots run`) manages your shared instructions, skills, MCP servers, and per-project T3 provider settings from one place.
 
 ---
 
@@ -74,10 +74,10 @@ For commit-by-commit technical details and upstream rebase instructions, see [**
 
 ### Recommended: Install with Roots CLI (`roots setup`)
 
-[Roots CLI](https://github.com/vincentvermeire/roots) downloads and SHA-256-verifies T3-Roots, installs your four coding harnesses (`claude`, `codex`, `opencode`, `agy`), configures per-project providers in T3-Roots, and syncs live gateway model allowlists:
+[Roots CLI](https://github.com/vincentvermeire/roots-cli) downloads and SHA-256-verifies T3-Roots, installs your four coding harnesses (`claude`, `codex`, `opencode`, `agy`), configures per-project providers in T3-Roots, and syncs live gateway model allowlists:
 
 ```sh
-npm install -g github:vincentvermeire/roots
+npm install -g github:vincentvermeire/roots-cli
 roots setup
 ```
 
@@ -119,7 +119,7 @@ Download the asset for your platform from [**Releases**](https://github.com/vinc
    In **1Password 8 → Settings → Developer**, enable **Integrate with 1Password CLI** and install `op` (`brew install --cask 1password-cli`). Ensure `/opt/homebrew/bin` (or `/usr/local/bin`) and `~/.local/bin` are in your login shell `PATH` (`~/.zprofile` / `~/.zshrc`).
 
 4. **Updating on macOS & ad-hoc signature re-prompts:**
-   Apple's `Squirrel.Mac` auto-updater requires an Apple Developer ID certificate, so automatic in-app updates are disabled on macOS fork builds. To update, upgrade Roots first (`npm install -g github:vincentvermeire/roots`) and run `roots setup`, or download the newest `.dmg`/`.zip` from Releases. Because each ad-hoc build has a new code signature hash, macOS Keychain (_Always Allow_), 1Password CLI approval, and macOS privacy permissions may prompt once after an upgrade.
+   Apple's `Squirrel.Mac` auto-updater requires an Apple Developer ID certificate, so automatic in-app updates are disabled on macOS fork builds. To update, upgrade Roots first (`npm install -g github:vincentvermeire/roots-cli`) and run `roots setup`, or download the newest `.dmg`/`.zip` from Releases. Because each ad-hoc build has a new code signature hash, macOS Keychain (_Always Allow_), 1Password CLI approval, and macOS privacy permissions may prompt once after an upgrade.
 
 ### Windows 11
 
@@ -147,7 +147,7 @@ If you use Roots, replace each project's `op-env://` key with an `op://` item re
 ## Documentation
 
 - [**T3-Roots Fork Architecture & Patch Register**](./docs/roots-fork.md)
-- [**Roots CLI Repository & Documentation**](https://github.com/vincentvermeire/roots)
+- [**Roots CLI Repository & Documentation**](https://github.com/vincentvermeire/roots-cli)
 - [**Upstream T3 Code Documentation**](./docs/README.md) ([Install](./docs/user/install.md) · [Permission Modes](./docs/user/permission-modes.md) · [Source Control](./docs/user/source-control.md) · [Development Runbook](./docs/operations/development.md))
 
 ## License
