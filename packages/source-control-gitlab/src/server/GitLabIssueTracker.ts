@@ -214,6 +214,7 @@ export const make: Effect.Effect<IssueTrackerApi, never, GitLabCli.GitLabCli> = 
         .execute({
           cwd: input.cwd,
           host: input.host,
+          callerNamedHost: input.host,
           args: [
             "api",
             input.path,

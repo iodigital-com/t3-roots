@@ -1,6 +1,9 @@
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as FileSystem from "effect/FileSystem";
+import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as TestSourceControlHost from "@t3tools/source-control-testing/TestSourceControlHost";
 
 import * as GitLabCli from "./GitLabCli.ts";
@@ -150,6 +153,52 @@ function tracker(
 }
 
 describe("GitLabIssueTracker", () => {
+  it.effect.each(["gitlab.com", "other.gitlab.example.com"])(
+    "scopes the saved token during issue reads and writes on %s",
+    (host) =>
+      Effect.gen(function* () {
+        const requests: Array<{ readonly env: unknown; readonly args: ReadonlyArray<string> }> = [];
+        const api = yield* GitLabIssueTracker.make.pipe(
+          Effect.provide(
+            GitLabCli.layer.pipe(
+              Layer.provide(
+                TestSourceControlHost.layer({
+                  settings: {
+                    ...DEFAULT_SERVER_SETTINGS,
+                    sourceControlHosts: { gitlab: { accessToken: "saved-default-token" } },
+                  },
+                  process: {
+                    run: (input) => {
+                      requests.push({ env: input.env, args: input.args });
+                      return Effect.succeed(
+                        TestSourceControlHost.processOutput(
+                          input.args.includes("PUT") ? "{}" : answer(input.args[1]!),
+                        ),
+                      );
+                    },
+                  },
+                }),
+              ),
+              Layer.provide(FileSystem.layerNoop({})),
+            ),
+          ),
+          Effect.provideService(HostProcess.Environment, { GITLAB_HOST: "gitlab.com" }),
+        );
+        const target = { cwd: "/w", host, scope: "acme/web", key: "42" };
+        yield* api.getIssue(target);
+        yield* api.setState!({ ...target, state: "Closed" });
+        expect(requests.some((request) => request.args[1] === "graphql")).toBe(true);
+        expect(requests.some((request) => request.args.includes("PUT"))).toBe(true);
+        for (const request of requests) {
+          expect(request.env).toEqual(
+            host === "gitlab.com"
+              ? { GITLAB_HOST: host, GITLAB_TOKEN: "saved-default-token" }
+              : { GITLAB_HOST: host, GITLAB_TOKEN: "", GITLAB_ACCESS_TOKEN: "", OAUTH_TOKEN: "" },
+          );
+        }
+      }),
+  );
+
   it.effect("joins the detail's endpoints into the neutral issue shape", () =>
     Effect.gen(function* () {
       const hosts = new Set<string | undefined>();
