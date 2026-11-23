@@ -154,6 +154,47 @@ describe("AntigravityAdapterV2 flavor", () => {
       outcome: { outcome: "selected", optionId: "opt-dev" },
     });
   });
+
+  it("wires Antigravity ask_question elicitation extraction into the flavor", () => {
+    const form = flavor.extractElicitationForm?.({
+      sessionId: "session-1",
+      mode: "form",
+      message: "The agent has a question.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "string",
+            title: "Which target branch?",
+            oneOf: [
+              { const: "1", title: "main" },
+              { const: "2", title: "update/t3-code-0.1.11" },
+            ],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Which target branch?",
+          },
+        },
+      },
+    });
+    assert.deepEqual(form?.questions, [
+      {
+        id: "q1",
+        header: "Question",
+        question: "Which target branch?",
+        options: [
+          { value: "1", label: "main", description: "main" },
+          { value: "2", label: "update/t3-code-0.1.11", description: "update/t3-code-0.1.11" },
+        ],
+      },
+    ]);
+    assert.deepEqual(form?.respond({ q1: "Custom branch" }), {
+      action: "accept",
+      content: { q1_other: "Custom branch" },
+    });
+  });
 });
 
 const layerSession = Layer.mergeAll(

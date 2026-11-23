@@ -21,8 +21,6 @@ import {
   parseSessionUpdateEvent,
 } from "@t3tools/provider-acp/server/runtimeModel";
 import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
-import { parseElicitationForm } from "../../../../../packages/provider-acp/src/server/elicitationForm.ts";
-import { buildPendingUserInputAnswers } from "../../../../../packages/client-runtime/src/state/pendingUserInput.ts";
 
 const elicitationRequest = {
   sessionId: "session-1",
@@ -192,14 +190,49 @@ describe("Antigravity elicitation questions", () => {
       content: { q1_other: "Custom only" },
     });
     expect(form?.respond({ q1: [] })).toEqual({ action: "accept", content: {} });
-    const customAnswers = buildPendingUserInputAnswers(form?.questions ?? [], {
-      q1: { customAnswer: "Custom only" },
-    });
-    expect(customAnswers).toEqual({ q1: "Custom only", q1_other: "" });
-    expect(form?.respond(customAnswers ?? {})).toEqual({
+    expect(form?.respond({ q1: "Custom only", q1_other: "" })).toEqual({
       action: "accept",
       content: { q1_other: "Custom only" },
     });
+    expect(form?.respond({ q1: "First step", q1_other: "Second step" })).toEqual({
+      action: "accept",
+      content: { q1_other: "First step\n\nSecond step" },
+    });
+    const multiPair = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      message: "The agent has 2 questions.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "array",
+            title: "First?",
+            items: { anyOf: elicitationRequest.requestedSchema.properties.q1.oneOf },
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: First?",
+          },
+          q2: {
+            type: "array",
+            title: "Second?",
+            items: { anyOf: elicitationRequest.requestedSchema.properties.q1.oneOf },
+          },
+          q2_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Second?",
+          },
+        },
+      },
+    });
+    expect(multiPair?.questions.map(({ id, header }) => ({ id, header }))).toEqual([
+      { id: "q1", header: "Question 1" },
+      { id: "q1_other", header: "Other 1" },
+      { id: "q2", header: "Question 2" },
+      { id: "q2_other", header: "Other 2" },
+    ]);
   });
 
   it("omits skipped optional answers and rejects invalid answer types", () => {
@@ -255,20 +288,24 @@ describe("Antigravity elicitation questions", () => {
     });
   });
 
-  it("preserves native nonnumeric option IDs", () => {
+  it("preserves native nonnumeric option IDs and optional option descriptions", () => {
     const form = extractAntigravityElicitationForm({
       ...elicitationRequest,
       requestedSchema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
         ...elicitationRequest.requestedSchema,
         properties: {
           ...elicitationRequest.requestedSchema.properties,
           q1: {
             ...elicitationRequest.requestedSchema.properties.q1,
-            oneOf: [{ const: "choice:opaque", title: "Keep" }],
+            oneOf: [{ const: "choice:opaque", title: "Keep", description: "Detailed choice" }],
           },
         },
       },
     });
+    expect(form?.questions[0]?.options).toEqual([
+      { value: "choice:opaque", label: "Keep", description: "Detailed choice" },
+    ]);
     expect(form?.respond({ q1: "choice:opaque" })).toEqual({
       action: "accept",
       content: { q1: "choice:opaque" },
@@ -336,7 +373,6 @@ describe("Antigravity elicitation questions", () => {
     expect(
       extractAntigravityElicitationForm({ ...elicitationRequest, requestedSchema: unknown }),
     ).toBeUndefined();
-    expect(parseElicitationForm(unknown, "Enter your name")?.questions).toHaveLength(1);
   });
 });
 
