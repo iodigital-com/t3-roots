@@ -55,7 +55,9 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-roots\.[0-9]+$ ]]
-          upstream_tag=$(git describe --tags --match 'v[0-9]*' --exclude '*-roots.*' --abbrev=0 HEAD)
+          upstream_tag=${GITHUB_REF_NAME%%-roots.*}
+          git fetch --no-tags https://github.com/pingdotgg/t3code.git "refs/tags/$upstream_tag"
+          git merge-base --is-ancestor FETCH_HEAD HEAD
           commit=$(git rev-parse HEAD)
           echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
