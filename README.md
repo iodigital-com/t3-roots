@@ -77,7 +77,7 @@ For commit-by-commit technical details and upstream rebase instructions, see [**
 [Roots CLI](https://github.com/vincentvermeire/roots-cli) downloads and SHA-256-verifies T3-Roots, installs your four coding harnesses (`claude`, `codex`, `opencode`, `agy`), configures per-project providers in T3-Roots, and syncs live gateway model allowlists:
 
 ```sh
-npm install -g --allow-git=root github:vincentvermeire/roots-cli
+npm install -g --allow-git=root git+https://github.com/vincentvermeire/roots-cli.git
 roots setup
 ```
 
@@ -119,7 +119,7 @@ Download the asset for your platform from [**Releases**](https://github.com/vinc
    In **1Password 8 → Settings → Developer**, enable **Integrate with 1Password CLI** and install `op` (`brew install --cask 1password-cli`). Ensure `/opt/homebrew/bin` (or `/usr/local/bin`) and `~/.local/bin` are in your login shell `PATH` (`~/.zprofile` / `~/.zshrc`).
 
 4. **Updating on macOS & ad-hoc signature re-prompts:**
-   Apple's `Squirrel.Mac` auto-updater requires an Apple Developer ID certificate, so automatic in-app updates are disabled on macOS fork builds. To update, upgrade Roots first (`npm install -g --allow-git=root github:vincentvermeire/roots-cli`) and run `roots setup`, or download the newest `.dmg`/`.zip` from Releases. Because each ad-hoc build has a new code signature hash, macOS Keychain (_Always Allow_), 1Password CLI approval, and macOS privacy permissions may prompt once after an upgrade.
+   Apple's `Squirrel.Mac` auto-updater requires an Apple Developer ID certificate, so automatic in-app updates are disabled on macOS fork builds. To update, upgrade Roots first (`npm install -g --allow-git=root git+https://github.com/vincentvermeire/roots-cli.git`) and run `roots setup`, or download the newest `.dmg`/`.zip` from Releases. Because each ad-hoc build has a new code signature hash, macOS Keychain (_Always Allow_), 1Password CLI approval, and macOS privacy permissions may prompt once after an upgrade.
 
 ### Windows 11
 
