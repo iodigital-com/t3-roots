@@ -1,6 +1,9 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it, afterEach, expect, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import { ChildProcessSpawner } from "effect/process";
 
 import { DEFAULT_SERVER_SETTINGS, SecretProviderId, VcsProcessExitError } from "@t3tools/contracts";
@@ -11,7 +14,10 @@ import * as GitLabCli from "./GitLabCli.ts";
 
 const mockedRun = vi.fn<SourceControlHost.SourceControlHost["Service"]["process"]["run"]>();
 const layer = it.layer(
-  GitLabCli.layer.pipe(Layer.provide(TestSourceControlHost.layer({ process: { run: mockedRun } }))),
+  GitLabCli.layer.pipe(
+    Layer.provide(TestSourceControlHost.layer({ process: { run: mockedRun } })),
+    Layer.provideMerge(NodeServices.layer),
+  ),
 );
 
 function processOutput(stdout: string): SourceControlHost.SourceControlProcessOutput {
@@ -44,7 +50,7 @@ it.effect.each(["detail", "list", "execute"] as const)(
               },
             },
             process: { run },
-          }),
+          }).pipe(Layer.merge(FileSystem.layerNoop({}))),
         ),
       );
       const read =
@@ -138,6 +144,54 @@ layer("GitLabCli.layer", (it) => {
         "authentication",
       );
     }),
+  );
+
+  // A strictly confined glab (Snap) has a private /tmp, so it cannot open the server's body file.
+  it.effect("sends the merge request description to glab on stdin, not as a file path", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const bodyDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-gitlab-mr-body-" });
+      const bodyFile = path.join(bodyDir, "t3code-pr-body.md");
+      yield* fileSystem.writeFileString(bodyFile, "## Summary\n\nFixes the thing.\n");
+      mockedRun.mockReturnValueOnce(Effect.succeed(processOutput("{}")));
+
+      const glab = yield* GitLabCli.GitLabCli;
+      yield* glab.createMergeRequest({
+        cwd: "/repo",
+        baseBranch: "main",
+        headSelector: "feature/mr",
+        title: "Add MR",
+        bodyFile,
+      });
+
+      const call = mockedRun.mock.calls.at(-1)?.[0];
+      expect(call?.args.join(" ")).not.toContain(bodyFile);
+      expect(call?.args).toContain("description=@-");
+      assert.strictEqual(call?.stdin, "## Summary\n\nFixes the thing.\n");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("fails with a typed error and skips glab when the description cannot be read", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const bodyDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-gitlab-mr-body-" });
+      const glab = yield* GitLabCli.GitLabCli;
+      const error = yield* glab
+        .createMergeRequest({
+          cwd: "/repo",
+          baseBranch: "main",
+          headSelector: "feature/mr",
+          title: "Add MR",
+          bodyFile: path.join(bodyDir, "missing.md"),
+        })
+        .pipe(Effect.flip);
+
+      assert.strictEqual(error._tag, "GitLabMergeRequestBodyReadError");
+      assert.strictEqual(error.detail, "The merge request description could not be read.");
+      expect(mockedRun).not.toHaveBeenCalled();
+    }).pipe(Effect.scoped),
   );
 
   it.effect("skips invalid entries when parsing MR lists", () =>
@@ -251,6 +305,8 @@ layer("GitLabCli.layer", (it) => {
 
   it.effect("creates same-project MRs without a repository lookup", () =>
     Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const bodyFile = yield* fileSystem.makeTempFileScoped({ prefix: "t3-gitlab-mr-body-" });
       mockedRun.mockReturnValueOnce(Effect.succeed(processOutput("{}")));
       const glab = yield* GitLabCli.GitLabCli;
       yield* glab.createMergeRequest({
@@ -258,7 +314,7 @@ layer("GitLabCli.layer", (it) => {
         baseBranch: "main",
         headSelector: "feature/fix",
         title: "Fix remote flow",
-        bodyFile: "/tmp/body.md",
+        bodyFile,
       });
       expect(mockedRun).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
@@ -274,11 +330,11 @@ layer("GitLabCli.layer", (it) => {
             "--raw-field",
             "title=Fix remote flow",
             "--field",
-            "description=@/tmp/body.md",
+            "description=@-",
           ],
         }),
       );
-    }),
+    }).pipe(Effect.scoped),
   );
 
   it.effect("surfaces a friendly error when the merge request is not found", () =>
@@ -311,16 +367,19 @@ layer("GitLabCli.layer", (it) => {
   );
 
   it.effect.each([
-    { repository: "group/project", args: ["api", "projects/group%2Fproject"] },
+    { repository: "group/project", args: ["api", "projects/group%2Fproject"], env: {} },
     {
       repository: "https://gitlab.example.com:8443/group/sub/project.git",
       args: ["api", "--hostname", "gitlab.example.com:8443", "projects/group%2Fsub%2Fproject"],
+      // The environment token is the default host's login, not this host's.
+      env: { GITLAB_TOKEN: "", GITLAB_ACCESS_TOKEN: "", OAUTH_TOKEN: "" },
     },
     {
       repository: "https://gitlab.com/group/project/-/tree/main",
       args: ["api", "--hostname", "gitlab.com", "projects/group%2Fproject"],
+      env: {},
     },
-  ])("looks up $repository by its project path", ({ repository, args }) =>
+  ])("looks up $repository by its project path", ({ repository, args, env }) =>
     Effect.gen(function* () {
       mockedRun.mockReturnValueOnce(
         Effect.succeed(
@@ -338,7 +397,9 @@ layer("GitLabCli.layer", (it) => {
       const glab = yield* GitLabCli.GitLabCli;
       yield* glab.getRepositoryCloneUrls({ cwd: "/repo", repository });
 
-      expect(mockedRun).toHaveBeenCalledWith(expect.objectContaining({ command: "glab", args }));
+      expect(mockedRun).toHaveBeenCalledWith(
+        expect.objectContaining({ command: "glab", args, env }),
+      );
     }),
   );
 
@@ -401,29 +462,47 @@ const tokenLayer = it.layer(
         process: { run: mockedRun },
       }),
     ),
+    Layer.provideMerge(NodeServices.layer),
   ),
 );
 
 tokenLayer("GitLabCli.layer with a saved access token", (it) => {
-  it.effect("passes the saved token to glab as GITLAB_TOKEN", () =>
-    Effect.gen(function* () {
-      mockedRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
+  it.effect.each([
+    {
+      callerNamedHost: undefined,
+      env: { GITLAB_HOST: "gitlab.example.com", GITLAB_TOKEN: "saved-token" },
+    },
+    {
+      callerNamedHost: "https://other.gitlab.example.com/group/project",
+      env: {
+        GITLAB_HOST: "gitlab.example.com",
+        GITLAB_TOKEN: "",
+        GITLAB_ACCESS_TOKEN: "",
+        OAUTH_TOKEN: "",
+      },
+    },
+  ])(
+    "passes the saved token only when a different host was not named",
+    ({ callerNamedHost, env }) =>
+      Effect.gen(function* () {
+        mockedRun.mockReturnValueOnce(Effect.succeed(processOutput("")));
 
-      yield* Effect.gen(function* () {
-        const glab = yield* GitLabCli.GitLabCli;
-        return yield* glab.execute({
-          cwd: "/repo",
-          args: ["mr", "list"],
-          host: "gitlab.example.com",
+        yield* Effect.gen(function* () {
+          const glab = yield* GitLabCli.GitLabCli;
+          return yield* glab.execute({
+            cwd: "/repo",
+            args: ["mr", "list"],
+            host: "gitlab.example.com",
+            ...(callerNamedHost === undefined ? {} : { callerNamedHost }),
+          });
         });
-      });
 
-      expect(mockedRun).toHaveBeenCalledWith(
-        expect.objectContaining({
-          command: "glab",
-          env: { GITLAB_HOST: "gitlab.example.com", GITLAB_TOKEN: "saved-token" },
-        }),
-      );
-    }),
+        expect(mockedRun).toHaveBeenCalledWith(
+          expect.objectContaining({
+            command: "glab",
+            env,
+          }),
+        );
+      }),
   );
 });

@@ -168,6 +168,8 @@ export const make = Effect.gen(function* () {
         selected.status === "error" ||
         !isProviderAvailable(selected) ||
         !isProviderTextGenerationCapable(selected) ||
+        selected.models.find((model) => model.slug === selection.model)?.supportsTextGeneration ===
+          false ||
         (operation === "generateReviewGuide" && !INVESTIGATING_DRIVERS.has(selected.driver)) ||
         exhaustedUsageWindow(selected, now, selection.model))
     ) {
@@ -221,7 +223,7 @@ export const make = Effect.gen(function* () {
       return yield* new TextGenerationError({
         operation,
         detail:
-          "Review guides need a coding agent that can read the checkout. None is ready. Pick Codex or Claude as the review guide model in Settings → Source control.",
+          "Review guides need a coding agent that can read the checkout. None is ready. Pick Codex or Claude as the review guide model in Settings → Source control & issues.",
       });
     }
     return yield* installationGate.execute(
