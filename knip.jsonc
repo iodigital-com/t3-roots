@@ -39,6 +39,8 @@
         "setup-worktree.ts",
         "sign-macos.ts",
         "prepare-server-compile-cache.cjs",
+        // release-smoke.ts invokes this script in a child process.
+        "resolve-nightly-release.ts",
         "smoke-desktop-app.ts",
         "verify-windows-desktop-artifact.ts",
       ],
