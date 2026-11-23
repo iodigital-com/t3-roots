@@ -1,12 +1,12 @@
 # T3-Roots Fork Reference
 
-This document maps the human-facing capabilities of **T3-Roots** (`vincentvermeire/t3code`) to the underlying patch commits maintained on top of upstream [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code), and describes how fork releases are built and updated.
+This document maps the human-facing capabilities of **T3-Roots** (`iodigital-com/t3-roots`) to the underlying patch commits maintained on top of upstream [`pingdotgg/t3code`](https://github.com/pingdotgg/t3code), and describes how fork releases are built and updated.
 
 ---
 
 ## Design principles
 
-1. **Generic capabilities only:** T3-Roots never hardcodes gateway URLs, organization domains, model names, or project names. [Roots CLI](https://github.com/vincentvermeire/roots) writes configuration into `~/.t3/userdata/settings.json`; T3-Roots enforces the generic secret, allowlist, helper, and MCP contracts.
+1. **Generic capabilities only:** T3-Roots never hardcodes gateway URLs, organization domains, model names, or project names. [Roots CLI](https://github.com/iodigital-com/roots-cli) writes configuration into `~/.t3/userdata/settings.json`; T3-Roots enforces the generic secret, allowlist, helper, and MCP contracts.
 2. **Small diff against upstream:** `main` is the T3-Roots release line: upstream `pingdotgg/t3code` plus the patches below, kept as separate commits. Upstream changes are pulled in regularly, and a patch is dropped as soon as upstream ships an equivalent feature.
 3. **Draft-first releases:** Pushing a `vX.Y.Z-roots.N` tag builds Windows x64 and macOS (`arm64` + `x64`) artifacts into a **draft** GitHub Release (`make_latest: false`), verified by checksums and smoke tests before manual publication.
 
@@ -60,7 +60,7 @@ Base tag on current branch (`roots/nightly-20261116`): `v0.1.10-nightly.20261116
 ## Releasing a new fork build
 
 1. Ensure formatting, linting, typechecks, and tests pass, and verify compatibility with Roots CLI's T3 settings tests (`roots/test/t3.test.mjs`).
-2. Commit and push the branch to `vincentvermeire/t3code`, then push a signed version tag matching `vX.Y.Z-roots.N` (for example `v0.1.10-roots.8`).
+2. Commit and push the branch to `iodigital-com/t3-roots`, then push a signed version tag matching `vX.Y.Z-roots.N` (for example `v0.1.10-roots.8`).
 3. GitHub Actions (`release-roots.yml`) builds all platforms, runs `codesign` and launch smoke checks on macOS plus CLI smoke checks on Linux, validates `SHA256SUMS`, and creates a **draft** GitHub Release.
 4. Review the draft release assets and `SHA256SUMS`, copy the three installer/archive SHA-256 digests (`T3-Roots-<ver>-arm64.zip`, `T3-Roots-<ver>-x64.zip`, `T3-Roots-<ver>-x64.exe`) into `t3Fork.sha256` in `roots` (`src/defaults.mjs`) alongside bumping `t3Fork.tag`, and — only when ready — publish the GitHub Release by hand with **"Set as the latest release"** ticked so the Windows NSIS in-app updater (which queries GitHub's latest release for `latest.yml`) discovers the new version.
 
