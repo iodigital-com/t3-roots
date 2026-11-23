@@ -14,7 +14,17 @@ This document maps the human-facing capabilities of **T3-Roots** (`iodigital-com
 
 ## Maintained patch groups
 
-Base tag on current branch (`roots/nightly-20261116`): `v0.1.10-nightly.20261116.4774`.
+Base tag on the current fork release branch (`main`): stable `v0.1.11` (`59651c1761`). The previous base was `v0.1.10-nightly.20261116.4774`; the update preserves the fork commits through an upstream merge.
+
+### Upstream integration: v0.1.11
+
+All maintained capability groups below remain necessary. Upstream now forwards Antigravity thread variables through `AntigravityAdapterV2RuntimeInput` and `AntigravityDriver.prepareSpawn`, so the fork's duplicate `processEnvironment` field on `AntigravityAcpRuntimeInput` and its old inline environment merge are removed. Upstream's environment-forwarding tests and the fork's new/resume/fork credential test cover this path. Private MCP validation, deferred tools and restart-on-thread-switch remain fork behavior.
+
+The merged driver also keeps upstream's compatibility check and mode-state-aware session mode mapping. Upstream now installs only the native Antigravity CLI and removes the external harness, so the old `harnessPath === null` private-MCP guard is removed; every conversation runtime validates native private MCP. GitLab keeps saved secret token resolution and readable failures alongside upstream's protection against sending the default host's token to a different caller-named host. macOS permission copy keeps the fork app name and upstream localisation.
+
+`customModels` retains upstream's string-or-descriptor setting format for Codex, Claude and Antigravity. Roots can continue supplying gateway model slugs or descriptors; `modelAllowlist` independently restricts picker snapshots and delegation. This update does not change Roots configuration or installed T3 data.
+
+Selected-only helpers reject models that cannot generate text before upstream's fallback can choose another instance. macOS permission translations use the configured app name in every locale.
 
 ### 1. 1Password Environments & Secret Resolution (`packages/secret-provider-onepassword`)
 

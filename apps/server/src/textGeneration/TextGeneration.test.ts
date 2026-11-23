@@ -299,6 +299,7 @@ it.effect.each([
   "not-installed",
   "exhausted",
   "unavailable",
+  "model-unavailable",
   "invalid",
   "failed",
   "generator",
@@ -320,7 +321,18 @@ it.effect.each([
         availability: isSelected && state === "unavailable" ? "unavailable" : "available",
         version: null,
         checkedAt: "1970-01-01T00:00:00Z",
-        models: [],
+        models:
+          isSelected && state === "model-unavailable"
+            ? [
+                {
+                  slug: selected.model,
+                  name: selected.model,
+                  isCustom: true,
+                  capabilities: null,
+                  supportsTextGeneration: false,
+                },
+              ]
+            : [],
         slashCommands: [],
         skills: [],
         ...(isSelected && state === "exhausted"
