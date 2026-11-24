@@ -4,6 +4,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as AcpWireSchema from "effect-acp/schema-v1";
 
 import {
+  extractAntigravityElicitationForm,
   extractAntigravityUserInputQuestion,
   antigravityApprovalOptions,
   antigravitySubagentOutput,
@@ -20,6 +21,360 @@ import {
   parseSessionUpdateEvent,
 } from "@t3tools/provider-acp/server/runtimeModel";
 import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
+
+const elicitationRequest = {
+  sessionId: "session-1",
+  mode: "form",
+  message: "The agent has a question.",
+  requestedSchema: {
+    type: "object",
+    properties: {
+      q1: {
+        type: "string",
+        title: "Which result should we use?",
+        oneOf: [
+          { const: "1", title: "Verified" },
+          { const: "2", title: "Needs review" },
+        ],
+      },
+      q1_other: {
+        type: "string",
+        title: "Other",
+        description: "Optional free-form answer to: Which result should we use?",
+      },
+    },
+  },
+} satisfies EffectAcpSchema.CreateElicitationRequest;
+
+describe("Antigravity elicitation questions", () => {
+  it("folds the captured single-underscore companion and shows the actual question", () => {
+    const form = extractAntigravityElicitationForm(elicitationRequest);
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question",
+        question: "Which result should we use?",
+        options: [
+          { value: "1", label: "Verified", description: "Verified" },
+          { value: "2", label: "Needs review", description: "Needs review" },
+        ],
+      },
+    ]);
+  });
+
+  it("shows four main questions and returns choice IDs or exact custom text", () => {
+    const properties = Object.fromEntries(
+      [1, 2, 3, 4].flatMap((index) => [
+        [`q${index}`, elicitationRequest.requestedSchema.properties.q1],
+        [`q${index}_other`, elicitationRequest.requestedSchema.properties.q1_other],
+      ]),
+    );
+    const form = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      message: "The agent has 4 questions.",
+      requestedSchema: { type: "object", properties },
+    });
+    expect(form?.questions.map(({ id, header, question }) => ({ id, header, question }))).toEqual(
+      [1, 2, 3, 4].map((index) => ({
+        id: `q${index}`,
+        header: `Question ${index}`,
+        question: "Which result should we use?",
+      })),
+    );
+    expect(form?.respond({ q1: "2", q2: "Custom\n\nparagraph", q3: "1", q4: "Verified" })).toEqual({
+      action: "accept",
+      content: { q1: "2", q2_other: "Custom\n\nparagraph", q3: "1", q4_other: "Verified" },
+    });
+    const indexedProperties = Object.fromEntries(
+      Array.from({ length: 10 }, (_, index) => index + 1)
+        .map((index) => `q${index}`)
+        .sort()
+        .flatMap((id) => [
+          [id, elicitationRequest.requestedSchema.properties.q1],
+          [`${id}_other`, elicitationRequest.requestedSchema.properties.q1_other],
+        ]),
+    );
+    expect(
+      extractAntigravityElicitationForm({
+        ...elicitationRequest,
+        message: "The agent has 10 questions.",
+        requestedSchema: { type: "object", properties: indexedProperties },
+      })?.questions.map((question) => question.id),
+    ).toEqual(Array.from({ length: 10 }, (_, index) => `q${index + 1}`));
+  });
+
+  it("preserves distinct IDs with duplicate labels and routes attachment text to Other", () => {
+    const form = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      requestedSchema: {
+        ...elicitationRequest.requestedSchema,
+        properties: {
+          ...elicitationRequest.requestedSchema.properties,
+          q1: {
+            ...elicitationRequest.requestedSchema.properties.q1,
+            oneOf: [
+              { const: "1", title: "Same" },
+              { const: "2", title: "Same" },
+            ],
+          },
+        },
+      },
+    });
+    expect(form?.questions[0]?.options.map((option) => option.value)).toEqual(["1", "2"]);
+    const reference = 'Attached image "screen.png": "/workspace/screen.png"';
+    expect(form?.respond({ q1: `2\n\n${reference}` })).toEqual({
+      action: "accept",
+      content: { q1: "2", q1_other: `Same\n\n${reference}` },
+    });
+    expect(form?.respond({ q1: `Custom\n\nparagraph\n\n${reference}` })).toEqual({
+      action: "accept",
+      content: { q1_other: `Custom\n\nparagraph\n\n${reference}` },
+    });
+    expect(form?.respond({ q1: reference })).toEqual({
+      action: "accept",
+      content: { q1_other: reference },
+    });
+    expect(form?.respond({ q1: "2\n\nOrdinary text" })).toEqual({
+      action: "accept",
+      content: { q1_other: "2\n\nOrdinary text" },
+    });
+  });
+
+  it("keeps multi-select and optional custom text separate, including array attachment references", () => {
+    const form = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      requestedSchema: {
+        ...elicitationRequest.requestedSchema,
+        properties: {
+          ...elicitationRequest.requestedSchema.properties,
+          q1: {
+            type: "array",
+            title: elicitationRequest.requestedSchema.properties.q1.title,
+            items: { anyOf: elicitationRequest.requestedSchema.properties.q1.oneOf },
+          },
+        },
+      },
+    });
+    expect(form?.questions).toEqual([
+      {
+        id: "q1",
+        header: "Question",
+        question: "Which result should we use?",
+        options: [
+          { value: "1", label: "Verified", description: "Verified" },
+          { value: "2", label: "Needs review", description: "Needs review" },
+        ],
+        multiSelect: true,
+      },
+      {
+        id: "q1_other",
+        header: "Other",
+        question: "Which result should we use?",
+        options: [],
+        required: false,
+      },
+    ]);
+    const reference = 'Attached file "notes.txt": "/workspace/notes.txt"';
+    expect(form?.respond({ q1: ["2", "1", "2", reference], q1_other: "More\n\ncontext" })).toEqual({
+      action: "accept",
+      content: { q1: ["2", "1"], q1_other: `More\n\ncontext\n\n${reference}` },
+    });
+    expect(form?.respond({ q1: ["1", "unknown"] })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: "1" })).toEqual({
+      action: "accept",
+      content: { q1_other: "1" },
+    });
+    expect(form?.respond({ q1: ["1"], q1_other: ["custom"] })).toEqual({ action: "cancel" });
+    expect(form?.respond({ q1: [], q1_other: "Custom only" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Custom only" },
+    });
+    expect(form?.respond({ q1: [] })).toEqual({ action: "accept", content: {} });
+    expect(form?.respond({ q1: "Custom only", q1_other: "" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Custom only" },
+    });
+    expect(form?.respond({ q1: "First step", q1_other: "Second step" })).toEqual({
+      action: "accept",
+      content: { q1_other: "First step\n\nSecond step" },
+    });
+    const multiPair = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      message: "The agent has 2 questions.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "array",
+            title: "First?",
+            items: { anyOf: elicitationRequest.requestedSchema.properties.q1.oneOf },
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: First?",
+          },
+          q2: {
+            type: "array",
+            title: "Second?",
+            items: { anyOf: elicitationRequest.requestedSchema.properties.q1.oneOf },
+          },
+          q2_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Second?",
+          },
+        },
+      },
+    });
+    expect(multiPair?.questions.map(({ id, header }) => ({ id, header }))).toEqual([
+      { id: "q1", header: "Question 1" },
+      { id: "q1_other", header: "Other 1" },
+      { id: "q2", header: "Question 2" },
+      { id: "q2_other", header: "Other 2" },
+    ]);
+  });
+
+  it("omits skipped optional answers and rejects invalid answer types", () => {
+    const form = extractAntigravityElicitationForm(elicitationRequest);
+    for (const answers of [{}, { q1: "" }, { q1: "  " }, { unrelated: "value" }]) {
+      expect(form?.respond(answers)).toEqual({ action: "accept", content: {} });
+    }
+    expect(form?.respond({ q1: ["1"] })).toEqual({ action: "cancel" });
+  });
+
+  it("supports native free-text questions alone and alongside choices", () => {
+    const textOnly = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      requestedSchema: {
+        type: "object",
+        properties: { q1_other: { type: "string", title: "What should we change?" } },
+      },
+    });
+    expect(textOnly?.questions).toEqual([
+      {
+        id: "q1_other",
+        header: "Question",
+        question: "What should we change?",
+        options: [],
+        required: false,
+      },
+    ]);
+    expect(textOnly?.respond({ q1_other: "Keep\n\nthis exact text" })).toEqual({
+      action: "accept",
+      content: { q1_other: "Keep\n\nthis exact text" },
+    });
+    expect(textOnly?.respond({ q1_other: "" })).toEqual({ action: "accept", content: {} });
+    expect(textOnly?.respond({ q1_other: ["Invalid"] })).toEqual({ action: "cancel" });
+    const mixed = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      message: "The agent has 2 questions.",
+      requestedSchema: {
+        type: "object",
+        required: [],
+        properties: {
+          ...elicitationRequest.requestedSchema.properties,
+          q2_other: { type: "string", title: "Why?" },
+        },
+      },
+    });
+    expect(mixed?.questions.map(({ id, header }) => ({ id, header }))).toEqual([
+      { id: "q1", header: "Question 1" },
+      { id: "q2_other", header: "Question 2" },
+    ]);
+    expect(mixed?.respond({ q1: "1", q2_other: "It works" })).toEqual({
+      action: "accept",
+      content: { q1: "1", q2_other: "It works" },
+    });
+  });
+
+  it("preserves native nonnumeric option IDs and optional option descriptions", () => {
+    const form = extractAntigravityElicitationForm({
+      ...elicitationRequest,
+      requestedSchema: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        ...elicitationRequest.requestedSchema,
+        properties: {
+          ...elicitationRequest.requestedSchema.properties,
+          q1: {
+            ...elicitationRequest.requestedSchema.properties.q1,
+            oneOf: [{ const: "choice:opaque", title: "Keep", description: "Detailed choice" }],
+          },
+        },
+      },
+    });
+    expect(form?.questions[0]?.options).toEqual([
+      { value: "choice:opaque", label: "Keep", description: "Detailed choice" },
+    ]);
+    expect(form?.respond({ q1: "choice:opaque" })).toEqual({
+      action: "accept",
+      content: { q1: "choice:opaque" },
+    });
+  });
+
+  it("leaves unrelated, incomplete and malformed schemas to the generic fallback", () => {
+    const { q1, q1_other } = elicitationRequest.requestedSchema.properties;
+    for (const properties of [
+      {},
+      { q1 },
+      { unrelated: q1 },
+      { q1, extra: q1_other },
+      { q1, q2_other: q1_other },
+      { q1, q1__other: q1_other },
+      { q1, q1_other: { ...q1_other, title: "Wrong" } },
+      { q1, q1_other: { ...q1_other, description: "Wrong" } },
+      { q1, q1_other: { ...q1_other, enum: ["text"] } },
+      { q1: { ...q1, oneOf: [] }, q1_other },
+      {
+        q1: {
+          ...q1,
+          oneOf: [
+            { const: "1", title: "First" },
+            { const: "1", title: "Second" },
+          ],
+        },
+        q1_other,
+      },
+      { q1: { ...q1, oneOf: [{ const: " ", title: "First" }] }, q1_other },
+      { q1: { ...q1, oneOf: [{ const: "1" }] }, q1_other },
+      { q1: { ...q1, oneOf: [{ const: "1", title: " " }] }, q1_other },
+      { q1: { ...q1, enum: ["1"] }, q1_other },
+      { q1: { ...q1, title: " " }, q1_other },
+      { q1: { type: "array", title: q1.title, items: { enum: ["1"] } }, q1_other },
+    ]) {
+      expect(
+        extractAntigravityElicitationForm({
+          ...elicitationRequest,
+          requestedSchema: { type: "object", properties },
+        }),
+      ).toBeUndefined();
+    }
+    for (const required of [["q1"], ["q1_other"], ["unknown"], ["q1", "q1"]]) {
+      expect(
+        extractAntigravityElicitationForm({
+          ...elicitationRequest,
+          requestedSchema: { ...elicitationRequest.requestedSchema, required },
+        }),
+      ).toBeUndefined();
+    }
+    expect(
+      extractAntigravityElicitationForm({ ...elicitationRequest, message: "Generic form" }),
+    ).toBeUndefined();
+    expect(
+      extractAntigravityElicitationForm({
+        sessionId: "session-1",
+        mode: "url",
+        message: "Sign in",
+        elicitationId: "sign-in",
+        url: "https://example.com",
+      }),
+    ).toBeUndefined();
+    const unknown = { type: "object", properties: { name: { type: "string", title: "Name" } } };
+    expect(
+      extractAntigravityElicitationForm({ ...elicitationRequest, requestedSchema: unknown }),
+    ).toBeUndefined();
+  });
+});
 
 const isSessionNotification = Schema.is(AcpWireSchema.SessionNotification);
 

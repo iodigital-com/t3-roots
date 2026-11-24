@@ -1,7 +1,9 @@
-import type {
-  ProviderApprovalOption,
-  ProviderUserInputAnswers,
-  UserInputQuestion,
+import {
+  type OrchestrationV2UserInputQuestion,
+  type ProviderApprovalOption,
+  type ProviderUserInputAnswers,
+  TrimmedNonEmptyString,
+  type UserInputQuestion,
 } from "@t3tools/contracts";
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import * as Option from "effect/Option";
@@ -11,6 +13,7 @@ import type * as EffectAcpSchema from "effect-acp/compat";
 import * as AcpWireSchema from "effect-acp/schema-v1";
 
 import type { AcpToolCallState } from "@t3tools/provider-acp/server/runtimeModel";
+import type { AcpAdapterV2Flavor } from "@t3tools/provider-acp/server/adapter";
 
 import {
   ANTIGRAVITY_EDIT_DIFF_OMITTED,
@@ -44,6 +47,251 @@ const decodeSingleAnswer = Schema.decodeUnknownOption(
   Schema.Union([Schema.String, Schema.Tuple([Schema.String])]),
 );
 const decodeToolCallContent = Schema.decodeUnknownOption(AcpWireSchema.ToolCallContent);
+
+const elicitationChoice = Schema.Struct({
+  const: TrimmedNonEmptyString,
+  title: TrimmedNonEmptyString,
+  description: Schema.optional(Schema.String),
+});
+const isElicitationForm = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("object"),
+    properties: Schema.Record(Schema.String, Schema.Unknown),
+    required: Schema.optional(Schema.Array(Schema.String)),
+  }),
+);
+const isElicitationChoice = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("string"),
+    title: TrimmedNonEmptyString,
+    oneOf: Schema.Array(elicitationChoice),
+  }),
+);
+const isElicitationMultiChoice = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("array"),
+    title: TrimmedNonEmptyString,
+    items: Schema.Struct({ anyOf: Schema.Array(elicitationChoice) }),
+  }),
+);
+const isElicitationCompanion = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("string"),
+    title: Schema.Literal("Other"),
+    description: Schema.String,
+  }),
+);
+const isElicitationTextOnly = Schema.is(
+  Schema.Struct({
+    type: Schema.Literal("string"),
+    title: TrimmedNonEmptyString,
+  }),
+);
+const hasOnlyKeys = (value: object, keys: ReadonlyArray<string>) =>
+  Object.keys(value).every((key) => keys.includes(key));
+
+const ATTACHMENT_REFERENCE_PATTERN =
+  /^Attached (?:image|file) "(?:\\.|[^"\\\r\n])*": "(?:\\.|[^"\\\r\n])*"/;
+const isAttachmentReference = (value: string) => ATTACHMENT_REFERENCE_PATTERN.test(value);
+
+// Intake appends server attachment references after `\n\n`; keep them with custom text.
+function splitAttachmentSuffix(value: string): { prefix: string; suffix: string } | undefined {
+  const marker = value.indexOf("\n\n");
+  if (marker < 0) return undefined;
+  const suffix = value.slice(marker);
+  return isAttachmentReference(suffix.slice(2))
+    ? { prefix: value.slice(0, marker), suffix }
+    : undefined;
+}
+
+interface AntigravityElicitationField {
+  readonly id: string;
+  readonly multi: boolean;
+  readonly textOnly?: boolean;
+  readonly options: OrchestrationV2UserInputQuestion["options"];
+}
+
+function parseAntigravityElicitationQuestion(
+  id: string,
+  field: unknown,
+  companionField: unknown,
+  questionCount: number,
+):
+  | {
+      readonly questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+      readonly field: AntigravityElicitationField;
+    }
+  | undefined {
+  const header = questionCount === 1 ? "Question" : `Question ${id.slice(1)}`;
+  if (field === undefined) {
+    if (!isElicitationTextOnly(companionField) || !hasOnlyKeys(companionField, ["type", "title"])) {
+      return undefined;
+    }
+    const textId = `${id}_other`;
+    return {
+      questions: [
+        {
+          id: textId,
+          header,
+          question: companionField.title,
+          options: [],
+          required: false,
+        },
+      ],
+      field: { id: textId, multi: false, textOnly: true, options: [] },
+    };
+  }
+
+  const single = isElicitationChoice(field);
+  const multi = isElicitationMultiChoice(field);
+  if (!single && !multi) return undefined;
+  if (!hasOnlyKeys(field, single ? ["type", "title", "oneOf"] : ["type", "title", "items"])) {
+    return undefined;
+  }
+  if (multi && !hasOnlyKeys(field.items, ["anyOf"])) return undefined;
+
+  const choices = single ? field.oneOf : field.items.anyOf;
+  if (
+    choices.length === 0 ||
+    new Set(choices.map((choice) => choice.const)).size !== choices.length ||
+    choices.some((choice) => !hasOnlyKeys(choice, ["const", "title", "description"]))
+  ) {
+    return undefined;
+  }
+
+  if (
+    !isElicitationCompanion(companionField) ||
+    companionField.description !== `Optional free-form answer to: ${field.title}` ||
+    !hasOnlyKeys(companionField, ["type", "title", "description"])
+  ) {
+    return undefined;
+  }
+
+  const options = choices.map((choice) => ({
+    value: choice.const,
+    label: choice.title,
+    description: choice.description?.trim() || choice.title,
+  }));
+  const questions: OrchestrationV2UserInputQuestion[] = [
+    {
+      id,
+      header,
+      question: field.title,
+      options,
+      ...(multi ? { multiSelect: true } : {}),
+    },
+  ];
+  if (multi) {
+    questions.push({
+      id: `${id}_other`,
+      header: questionCount === 1 ? "Other" : `Other ${id.slice(1)}`,
+      question: field.title,
+      options: [],
+      required: false,
+    });
+  }
+  return { questions, field: { id, multi, options } };
+}
+
+function respondToAntigravityElicitation(
+  fields: ReadonlyArray<AntigravityElicitationField>,
+  answers: ProviderUserInputAnswers,
+): EffectAcpSchema.CreateElicitationResponse {
+  const content: Record<string, EffectAcpSchema.ElicitationContentValue> = {};
+  for (const { id, multi, textOnly, options } of fields) {
+    const answer = Object.hasOwn(answers, id) ? answers[id] : undefined;
+    if (textOnly) {
+      if (answer !== undefined && typeof answer !== "string") return { action: "cancel" };
+      if (typeof answer === "string" && answer.trim()) content[id] = answer;
+      continue;
+    }
+
+    const otherId = `${id}_other`;
+    const other = multi && Object.hasOwn(answers, otherId) ? answers[otherId] : undefined;
+    if (other !== undefined && typeof other !== "string") return { action: "cancel" };
+    const custom: string[] = [];
+
+    if (multi) {
+      if (typeof answer === "string") {
+        if (answer.trim()) custom.push(answer);
+        if (typeof other === "string" && other.trim()) custom.push(other);
+        if (custom.length > 0) content[otherId] = custom.join("\n\n");
+        continue;
+      }
+      if (answer !== undefined && !Array.isArray(answer)) return { action: "cancel" };
+      if (typeof other === "string" && other.trim()) custom.push(other);
+      const selected: string[] = [];
+      for (const entry of answer ?? []) {
+        if (typeof entry !== "string") return { action: "cancel" };
+        if (options.some((option) => option.value === entry)) {
+          if (!selected.includes(entry)) selected.push(entry);
+        } else if (isAttachmentReference(entry)) {
+          custom.push(entry);
+        } else {
+          return { action: "cancel" };
+        }
+      }
+      if (selected.length > 0) content[id] = selected;
+    } else if (answer !== undefined) {
+      if (typeof answer !== "string") return { action: "cancel" };
+      if (options.some((option) => option.value === answer)) {
+        content[id] = answer;
+      } else if (answer.trim()) {
+        const split = splitAttachmentSuffix(answer);
+        const selected =
+          split === undefined ? undefined : options.find((option) => option.value === split.prefix);
+        if (selected && split !== undefined) {
+          content[id] = split.prefix;
+          custom.push(`${selected.label}${split.suffix}`);
+        } else {
+          custom.push(answer);
+        }
+      }
+    }
+
+    if (custom.length > 0) content[otherId] = custom.join("\n\n");
+  }
+  return { action: "accept", content };
+}
+
+/** agy ask_question pairs qN choices with qN_other; both fields are read independently. */
+export const extractAntigravityElicitationForm: NonNullable<
+  AcpAdapterV2Flavor["extractElicitationForm"]
+> = (request) => {
+  if (request.mode !== "form" || !isElicitationForm(request.requestedSchema)) return undefined;
+  const schema = request.requestedSchema;
+  if (!hasOnlyKeys(schema, ["$schema", "type", "properties", "required"])) return undefined;
+  if ((schema.required?.length ?? 0) > 0) return undefined;
+
+  const { properties } = schema;
+  const keys = Object.keys(properties);
+  if (keys.some((id) => !/^q[1-9]\d*(?:_other)?$/.test(id))) return undefined;
+  const ids = [...new Set(keys.map((id) => id.replace(/_other$/, "")))].sort(
+    (left, right) => Number(left.slice(1)) - Number(right.slice(1)),
+  );
+  if (ids.length === 0 || ids.some((id, index) => id !== `q${index + 1}`)) return undefined;
+  const expectedMessage =
+    ids.length === 1 ? "The agent has a question." : `The agent has ${ids.length} questions.`;
+  if (request.message !== expectedMessage) return undefined;
+
+  const questions: OrchestrationV2UserInputQuestion[] = [];
+  const fields: AntigravityElicitationField[] = [];
+  for (const id of ids) {
+    const parsed = parseAntigravityElicitationQuestion(
+      id,
+      properties[id],
+      properties[`${id}_other`],
+      ids.length,
+    );
+    if (parsed === undefined) return undefined;
+    questions.push(...parsed.questions);
+    fields.push(parsed.field);
+  }
+  return {
+    questions,
+    respond: (answers) => respondToAntigravityElicitation(fields, answers),
+  };
+};
 
 /**
  * The agent goes on running a command after its prompt ends, and replies by itself when the
