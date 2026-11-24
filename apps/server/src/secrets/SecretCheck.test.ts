@@ -69,6 +69,7 @@ const setup = Effect.fn("SecretCheckTest.setup")(function* (
   } = {},
 ) {
   const reads: Array<string> = [];
+  const batches: Array<ReadonlyArray<string>> = [];
   const created: Array<{ instanceId: ProviderInstanceId; secrets: ReadonlyArray<unknown> }> = [];
   const createdConfigs: Array<unknown> = [];
   const refreshed: Array<ProviderInstanceId> = [];
@@ -84,14 +85,18 @@ const setup = Effect.fn("SecretCheckTest.setup")(function* (
       invalidReferenceMessage: "Use fake://item.",
     }),
     read: (_config, references) =>
-      Effect.forEach(references, (reference) =>
-        (options.beforeRead?.(reference) ?? Effect.void).pipe(
-          Effect.andThen(
-            Effect.sync(() => {
-              reads.push(reference);
-              const answers = vault.get(reference) ?? [];
-              return answers.length > 1 ? answers.shift() : answers[0];
-            }),
+      Effect.sync(() => batches.push([...references])).pipe(
+        Effect.andThen(
+          Effect.forEach(references, (reference) =>
+            (options.beforeRead?.(reference) ?? Effect.void).pipe(
+              Effect.andThen(
+                Effect.sync(() => {
+                  reads.push(reference);
+                  const answers = vault.get(reference) ?? [];
+                  return answers.length > 1 ? answers.shift() : answers[0];
+                }),
+              ),
+            ),
           ),
         ),
       ),
@@ -184,7 +189,17 @@ const setup = Effect.fn("SecretCheckTest.setup")(function* (
   );
   const secretCheck = yield* SecretCheck.SecretCheck.pipe(Effect.provide(services));
   const resolver = yield* SecretResolver.SecretResolver.pipe(Effect.provide(resolverContext));
-  return { secretCheck, registry, mutator, resolver, reads, created, createdConfigs, refreshed };
+  return {
+    secretCheck,
+    registry,
+    mutator,
+    resolver,
+    reads,
+    batches,
+    created,
+    createdConfigs,
+    refreshed,
+  };
 });
 
 const layerTest = Layer.mergeAll(
@@ -200,6 +215,37 @@ const layerTest = Layer.mergeAll(
 ).pipe(Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
 
 it.layer(layerTest)("SecretCheck", (it) => {
+  it.effect(
+    "retries a failed startup batch once and restores each instance with its own secret",
+    () =>
+      Effect.gen(function* () {
+        const vault = new Map<string, Array<string | undefined>>([
+          [wanted.reference, [undefined]],
+          [other.reference, [undefined]],
+        ]);
+        const server = yield* setup(vault, [wanted, wanted]);
+        assert.deepStrictEqual(server.batches, [[wanted.reference, other.reference]]);
+        assert.lengthOf(yield* server.registry.listUnavailable, 2);
+        vault.set(wanted.reference, ["project-a"]);
+        vault.set(other.reference, ["project-b"]);
+        assert.deepStrictEqual(yield* server.resolver.read([wanted, other]), [
+          undefined,
+          undefined,
+        ]);
+        assert.lengthOf(server.batches, 1);
+
+        yield* server.mutator.reloadSecrets();
+        assert.deepStrictEqual(server.batches, [
+          [wanted.reference, other.reference],
+          [wanted.reference, other.reference],
+        ]);
+        assert.deepStrictEqual(yield* server.registry.listUnavailable, []);
+        assert.deepStrictEqual(server.created, [
+          { instanceId: dependent, secrets: ["project-a", "project-a"] },
+          { instanceId: unrelated, secrets: ["project-b"] },
+        ]);
+      }),
+  );
   it.effect(
     "a readable secret rebuilds and refreshes only the instances that read it, from that one read",
     () =>
@@ -278,8 +324,15 @@ it.layer(layerTest)("SecretCheck", (it) => {
         [other.reference, ["other-key"]],
       ]);
       const server = yield* setup(vault, [wanted, locked]);
-      // A Settings refresh while the vault is locked keeps the live instance and caches the failure.
+      // A failed Settings refresh must retain credentials for later rebuilds too.
       yield* server.mutator.reloadSecrets(dependent);
+      const createdBefore = server.created.length;
+      const readsBefore = server.reads.length;
+      yield* server.mutator.rebuild([dependent]);
+      assert.deepStrictEqual(server.created.slice(createdBefore), [
+        { instanceId: dependent, secrets: ["wanted-old", "locked-key"] },
+      ]);
+      assert.deepStrictEqual(server.reads.slice(readsBefore), []);
       vault.set(wanted.reference, ["wanted-new"]);
 
       assert.deepStrictEqual(yield* server.secretCheck.check(wanted), { _tag: "Resolved" });

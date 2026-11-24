@@ -773,6 +773,60 @@ describe("resolveComposerProviderSelection", () => {
     expect(selection.unavailableProviderInstanceId).toBe(missingInstanceId);
   });
 
+  it.each(["codex", "antigravity"])(
+    "blocks fallback from an unavailable selected %s instance",
+    (driver) => {
+      const failed = entry(driver, "work_provider", {
+        availability: "unavailable",
+        status: "error",
+        installed: false,
+        message: "Could not read a secret.",
+      });
+      const input = {
+        entries: [failed],
+        candidateInstanceIds: [failed.instanceId],
+        lockedProvider: ProviderDriverKind.make(driver),
+        lockedInstanceId: failed.instanceId,
+      };
+      const selection = resolveComposerProviderSelection(input);
+      expect(selection.selectedProviderEntry).toBeUndefined();
+      expect(selection.unavailableProviderEntry?.snapshot.message).toBe("Could not read a secret.");
+      expect(
+        resolveComposerProviderSelection({
+          ...input,
+          candidateInstanceIds: [],
+          lockedProvider: null,
+          lockedInstanceId: null,
+        }).unavailableProviderEntry?.instanceId,
+      ).toBe(failed.instanceId);
+      const healthy = entry(driver, "other_project");
+      const withFallback = resolveComposerProviderSelection({
+        ...input,
+        entries: [failed, healthy],
+        lockedProvider: null,
+        lockedInstanceId: null,
+      });
+      expect(withFallback.selectedProviderEntry).toBeUndefined();
+      expect(withFallback.unavailableProviderEntry?.instanceId).toBe(failed.instanceId);
+      expect(withFallback.unavailableProviderInstanceId).toBe(failed.instanceId);
+      const unselected = resolveComposerProviderSelection({
+        ...input,
+        entries: [failed, healthy],
+        candidateInstanceIds: [],
+        lockedProvider: null,
+        lockedInstanceId: null,
+      });
+      expect(unselected.selectedProviderEntry?.instanceId).toBe(healthy.instanceId);
+      expect(unselected.unavailableProviderEntry).toBeUndefined();
+      expect(
+        resolveComposerProviderSelection({
+          ...input,
+          entries: [{ ...failed, enabled: false }],
+        }).unavailableProviderEntry,
+      ).toBeUndefined();
+    },
+  );
+
   it("keeps the session's continuation group when another instance was selected", () => {
     const sessionEntry = entry("antigravity", "google_work", {
       enabled: false,

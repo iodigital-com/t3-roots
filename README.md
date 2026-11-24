@@ -36,10 +36,10 @@ Out of the box, upstream T3 Code assumes developers sign in to personal agent su
 
 Instead of adding gateway-specific logic to T3 Code, T3-Roots adds five clean, general capabilities:
 
-### 1. 1Password Environments & Single-Prompt Unlocking
+### 1. 1Password Environments & Batched Secret Reads
 
 - **Native `op-env://` references:** Resolves 1Password Environment variables (`op-env://<environment-id>/<VAR>`) natively alongside standard `op://` item references, without falling back to ambient environment variables when a secret is missing.
-- **Batched single-unlock reads:** Groups non-overlapping 1Password Environments and `op://` item references into a single `op run` invocation so startup unlocks everything with **one** Touch ID or Windows Hello prompt.
+- **Batched provider reads:** Groups non-overlapping 1Password Environments and `op://` item references into one `op run` invocation per compatible account and Environment batch. T3 keeps the resolved provider credentials in memory. Separate GitLab token reads and SSH authorization can still require their own approvals.
 - **Windows desktop native-Node prompt bridge:** On Windows 11 desktop builds (where 1Password's desktop app refuses to show approval dialogs to an Electron-as-Node parent), T3-Roots transparently relays `op` calls through native `node` when available on `PATH`.
 
 ### 2. Per-Project Model Governance & Strict Cost Isolation

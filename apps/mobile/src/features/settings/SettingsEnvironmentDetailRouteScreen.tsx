@@ -376,16 +376,18 @@ function EnvironmentDetail({ environmentId }: { readonly environmentId: Environm
                             </Text>
                           </View>
                           <Text className="text-sm text-foreground-muted">
-                            {provider.versionAdvisory?.latestVersion
-                              ? gt("{version} · Latest {latest}", {
-                                  version: provider.installed
-                                    ? (provider.version ?? gt("Version unknown"))
-                                    : gt("Not installed"),
-                                  latest: provider.versionAdvisory.latestVersion,
-                                })
-                              : provider.installed
-                                ? (provider.version ?? gt("Version unknown"))
-                                : gt("Not installed")}
+                            {provider.availability === "unavailable"
+                              ? gt("Unavailable")
+                              : provider.versionAdvisory?.latestVersion
+                                ? gt("{version} · Latest {latest}", {
+                                    version: provider.installed
+                                      ? (provider.version ?? gt("Version unknown"))
+                                      : gt("Not installed"),
+                                    latest: provider.versionAdvisory.latestVersion,
+                                  })
+                                : provider.installed
+                                  ? (provider.version ?? gt("Version unknown"))
+                                  : gt("Not installed")}
                           </Text>
                           {provider.updateState && provider.updateState.status !== "idle" ? (
                             <Text

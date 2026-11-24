@@ -122,7 +122,7 @@ const readInstanceSecrets = Effect.fn("ProviderInstanceRegistry.readInstanceSecr
   const values = references.map((reference) =>
     isChecked(reference) ? checked?.value : read[readIndex++],
   );
-  const unreadable: Array<string> = [];
+  const unreadable: Array<{ name: string; reference: SecretReference }> = [];
   let index = 0;
   // An empty secret reads as unreadable, so a driver cannot fall back to an inherited credential.
   const next = () => {
@@ -133,15 +133,15 @@ const readInstanceSecrets = Effect.fn("ProviderInstanceRegistry.readInstanceSecr
     if (typeof variable.value === "string") return [{ ...variable, value: variable.value }];
     const secret = next();
     if (secret === undefined) {
-      unreadable.push(variable.name);
+      unreadable.push({ name: variable.name, reference: variable.value });
       return [];
     }
     return [{ ...variable, value: secret, sensitive: true }];
   });
-  const config = configFields.flatMap(({ field, key }) => {
+  const config = configFields.flatMap(({ field, key, reference }) => {
     const secret = next();
     if (secret !== undefined) return [{ field, key, value: secret }];
-    unreadable.push(field);
+    unreadable.push({ name: field, reference });
     return [];
   });
   const secrets: InstanceSecrets = { environment, config };
@@ -311,7 +311,12 @@ const buildEntry = Effect.fn("ProviderInstanceRegistry.buildEntry")(function* <R
         instanceId,
         displayName: entry.displayName,
         accentColor: entry.accentColor,
-        reason: `Could not read ${unreadable.join(", ")} from its secret provider. Unlock it, then refresh.`,
+        enabled: true,
+        reason: `Could not read ${unreadable.map(({ name }) => name).join(", ")} from its secret provider. ${
+          unreadable.some(({ reference }) => /^op(?:-env)?:\/\//.test(reference.reference))
+            ? "Check the reference and 1Password CLI integration. If using the desktop app, start and unlock it. Then refresh providers in Settings."
+            : "Check the reference and unlock the secret provider, then refresh providers in Settings."
+        }`,
       }),
     };
   }
@@ -582,8 +587,8 @@ export const makeProviderInstanceRegistry = Effect.fn(
       if (checked === undefined) {
         const resolver = yield* SecretResolver.SecretResolver;
         const references = targets.flatMap(([, entry]) => secretReferencesOf(driversById, entry));
-        yield* resolver.invalidate(references);
-        yield* resolver.read(references);
+        // A failed refresh keeps known values available to later instance rebuilds.
+        yield* resolver.read(references, { fresh: true });
       }
       const live = yield* Ref.get(entries);
       const rebuild = new Set<ProviderInstanceId>();

@@ -83,7 +83,7 @@ export class GitLabAccessTokenReadError extends Schema.TaggedError<GitLabAccessT
   },
 ) {
   get detail(): string {
-    return "The GitLab access token could not be read from the secret provider (for example, 1Password is locked). Unlock it, then use Settings → Source control → GitLab → check the access token, and retry.";
+    return "The GitLab access token could not be read from the secret provider. If using the 1Password desktop app, start and unlock it and check CLI integration. Then use Settings → Source control → GitLab → check the access token, and retry.";
   }
 
   get userFacingDetail(): string {
