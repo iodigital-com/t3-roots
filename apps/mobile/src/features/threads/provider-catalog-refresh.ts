@@ -11,7 +11,7 @@ import { m } from "../../i18n/messages";
 
 type RefreshProvidersTarget = {
   readonly environmentId: EnvironmentId;
-  readonly input: { readonly refreshModels: true };
+  readonly input: { readonly refreshModels: true; readonly reloadSecrets: true };
 };
 
 export function createProviderCatalogRefreshRunner<Result>(
@@ -21,7 +21,10 @@ export function createProviderCatalogRefreshRunner<Result>(
 
   return (environmentId: EnvironmentId): Promise<Result> => {
     if (pending) return pending;
-    pending = refreshProviders({ environmentId, input: { refreshModels: true } }).finally(() => {
+    pending = refreshProviders({
+      environmentId,
+      input: { refreshModels: true, reloadSecrets: true },
+    }).finally(() => {
       pending = null;
     });
     return pending;

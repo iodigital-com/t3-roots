@@ -46,10 +46,11 @@ credential in 1Password and refresh to use the new value.
 
 ## When a secret cannot be read
 
-If 1Password is locked or signed out, the provider or feature that needs the secret shows an error
-naming the secret provider. Unlock 1Password on the server's machine, then select **Refresh** in
-**Settings → Providers**. T3 Code never replaces a saved credential it cannot read with another
-login.
+If a secret cannot be read, check the reference and 1Password CLI integration. If you use the
+desktop app, start and unlock 1Password on the server's machine. Then select **Refresh** in
+**Settings → Providers**, or **Refresh providers** in the mobile environment settings. A thread's
+provider error also has a **Refresh** button for that provider. No T3 Code restart is needed.
+T3 Code never replaces a saved credential it cannot read with another login.
 
 ## Remove a secret provider
 

@@ -14,6 +14,7 @@ export interface UnavailableProviderSnapshotInput {
   readonly displayName?: string | undefined;
   readonly accentColor?: string | undefined;
   readonly reason: string;
+  readonly enabled?: boolean;
   readonly checkedAt?: string;
 }
 
@@ -28,7 +29,7 @@ export const buildUnavailableProviderSnapshot = Effect.fn(
   // No driver ran, so its setup capabilities are still unknown.
   const { setup: _setup, ...base } = buildServerProvider({
     presentation: { displayName },
-    enabled: false,
+    enabled: input.enabled ?? false,
     checkedAt,
     models: [],
     skills: [],

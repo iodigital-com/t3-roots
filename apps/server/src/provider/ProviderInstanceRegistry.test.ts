@@ -1009,6 +1009,12 @@ describe("ProviderInstanceRegistry secret environment", () => {
       const [unavailable] = yield* registry.listUnavailable;
       expect(unavailable?.instanceId).toBe(instanceId);
       expect(unavailable?.unavailableReason).toContain("OPENAI_API_KEY");
+      expect(unavailable?.enabled).toBe(true);
+      expect(unavailable?.status).toBe("error");
+      expect(unavailable?.unavailableReason).toContain("1Password CLI integration");
+      expect(unavailable?.unavailableReason).toContain("start and unlock it");
+      expect(unavailable?.unavailableReason).toContain("refresh providers in Settings");
+      expect(unavailable?.unavailableReason).not.toContain(secret.reference);
 
       // A settings save that leaves it alone does not read the vault again.
       yield* mutator.reconcile({ ...fixture.configMap });
@@ -1036,7 +1042,7 @@ describe("ProviderInstanceRegistry secret environment", () => {
 
       fixture.vault.set(secret.reference, "sk-live");
       yield* mutator.reloadSecrets();
-      expect(fixture.invalidated).toEqual([[secret.reference]]);
+      expect(fixture.invalidated).toEqual([]);
       expect(yield* registry.getInstance(instanceId)).toBeDefined();
       expect(yield* registry.listUnavailable).toEqual([]);
 

@@ -162,7 +162,11 @@ export const ProviderStatusBanner = memo(function ProviderStatusBanner({
     setIsRefreshing(true);
     await refreshProviders({
       environmentId,
-      input: { instanceId: status.instanceId, refreshModels: true },
+      input: {
+        instanceId: status.instanceId,
+        refreshModels: true,
+        ...(status.availability === "unavailable" ? { reloadSecrets: true } : {}),
+      },
     });
     refreshingRef.current = false;
     setIsRefreshing(false);

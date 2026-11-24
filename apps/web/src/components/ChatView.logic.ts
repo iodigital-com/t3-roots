@@ -518,26 +518,37 @@ export function resolveComposerProviderSelection(input: {
       (!lockedContinuationGroupKey || entry.continuationGroupKey === lockedContinuationGroupKey) &&
       (!requiresExactInstance || entry.instanceId === input.lockedInstanceId),
   );
-  const selectedProviderEntry =
-    input.candidateInstanceIds
-      .map((candidate) =>
-        compatibleEntries.find(
-          (entry) => entry.instanceId === candidate && entry.enabled && entry.isAvailable,
-        ),
-      )
-      .find((entry) => entry !== undefined) ??
-    resolveSelectableProviderInstanceEntry(
-      compatibleEntries.filter((entry) => entry.driverKind === requestedDriverKind),
-      undefined,
-    ) ??
-    resolveSelectableProviderInstanceEntry(compatibleEntries, undefined);
+  const diagnosticInstanceId = input.lockedProvider
+    ? (input.lockedInstanceId ?? requestedInstanceId)
+    : requestedInstanceId;
+  const requestedUnavailableEntry = compatibleEntries.find(
+    (entry) => entry.instanceId === diagnosticInstanceId && entry.enabled && !entry.isAvailable,
+  );
+  const selectedProviderEntry = requestedUnavailableEntry
+    ? undefined
+    : (input.candidateInstanceIds
+        .map((candidate) =>
+          compatibleEntries.find(
+            (entry) => entry.instanceId === candidate && entry.enabled && entry.isAvailable,
+          ),
+        )
+        .find((entry) => entry !== undefined) ??
+      resolveSelectableProviderInstanceEntry(
+        compatibleEntries.filter((entry) => entry.driverKind === requestedDriverKind),
+        undefined,
+      ) ??
+      resolveSelectableProviderInstanceEntry(compatibleEntries, undefined));
+  const unavailableProviderEntry =
+    requestedUnavailableEntry ??
+    (diagnosticInstanceId === undefined && !selectedProviderEntry
+      ? compatibleEntries.find((entry) => entry.enabled && !entry.isAvailable)
+      : undefined);
   const unavailableProviderInstanceId = selectedProviderEntry
     ? undefined
-    : input.lockedProvider
-      ? (input.lockedInstanceId ?? requestedInstanceId)
-      : requestedInstanceId;
+    : (diagnosticInstanceId ?? unavailableProviderEntry?.instanceId);
   return {
     selectedProviderEntry,
+    unavailableProviderEntry,
     requestedInstanceId,
     requestedDriverKind,
     lockedContinuationGroupKey,

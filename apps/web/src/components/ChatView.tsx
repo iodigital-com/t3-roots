@@ -1376,20 +1376,22 @@ export default function ChatView(props: ChatViewProps) {
     activeProject?.id ?? null,
   );
   const activeThreadModelInstanceId = activeThread?.modelSelection.instanceId;
-  const { selectedProviderEntry, requestedDriverKind } = resolveComposerProviderSelection({
-    entries: providerInstanceEntries,
-    candidateInstanceIds: [
-      selectedProviderByThreadId,
-      activeRuntime?.providerInstanceId,
-      activeThreadModelInstanceId,
-      activeProjectDefaultModelSelection?.instanceId,
-    ],
-    lockedProvider,
-    lockedInstanceId: activeRuntime?.providerInstanceId ?? activeThreadModelInstanceId,
-  });
+  const { selectedProviderEntry, unavailableProviderEntry, requestedDriverKind } =
+    resolveComposerProviderSelection({
+      entries: providerInstanceEntries,
+      candidateInstanceIds: [
+        selectedProviderByThreadId,
+        activeRuntime?.providerInstanceId,
+        activeThreadModelInstanceId,
+        activeProjectDefaultModelSelection?.instanceId,
+      ],
+      lockedProvider,
+      lockedInstanceId: activeRuntime?.providerInstanceId ?? activeThreadModelInstanceId,
+    });
   const selectedProvider = selectedProviderEntry?.driverKind ?? requestedDriverKind;
   const activeProviderInstanceId = selectedProviderEntry?.instanceId ?? null;
-  const activeProviderStatus = selectedProviderEntry?.snapshot ?? null;
+  const activeProviderStatus =
+    selectedProviderEntry?.snapshot ?? unavailableProviderEntry?.snapshot ?? null;
   const conversationProviderStatus =
     providerStatuses.find((status) => status.instanceId === activeRuntime?.providerInstanceId) ??
     activeProviderStatus;
@@ -1764,16 +1766,17 @@ export default function ChatView(props: ChatViewProps) {
     null,
     DismissedFallbackWindowSchema,
   );
+  const providerStatusForBanner = unavailableProviderEntry?.snapshot ?? activeProviderStatus;
   const providerStatusDismissalKey = getProviderStatusDismissalKey(
     providerEnvironmentId,
-    activeProviderStatus,
+    providerStatusForBanner,
   );
   const providerStatusDismissed = useProviderStatusBannerDismissed(providerStatusDismissalKey);
   const visibleProviderStatus = shouldShowProviderStatusBanner(
-    activeProviderStatus,
+    providerStatusForBanner,
     providerStatusDismissed,
   )
-    ? activeProviderStatus
+    ? providerStatusForBanner
     : null;
   const hasTimelineTopBanner = Boolean(timelineThreadError) || visibleProviderStatus !== null;
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;

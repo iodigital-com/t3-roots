@@ -9,7 +9,7 @@ import {
 } from "./provider-catalog-refresh";
 
 describe("mobile provider catalog refresh", () => {
-  it("requests model discovery for the selected environment and deduplicates pending taps", async () => {
+  it("reloads secrets and models for the selected environment and deduplicates pending taps", async () => {
     let resolveRefresh: ((value: "refreshed") => void) | undefined;
     const refreshProviders = vi.fn(
       () =>
@@ -27,7 +27,7 @@ describe("mobile provider catalog refresh", () => {
     expect(refreshProviders).toHaveBeenCalledOnce();
     expect(refreshProviders).toHaveBeenCalledWith({
       environmentId,
-      input: { refreshModels: true },
+      input: { refreshModels: true, reloadSecrets: true },
     });
 
     resolveRefresh?.("refreshed");

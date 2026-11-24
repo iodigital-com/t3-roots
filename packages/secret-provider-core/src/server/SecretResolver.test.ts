@@ -121,6 +121,30 @@ describe("SecretResolver", () => {
     }),
   );
 
+  it.effect("shares a pending batch with concurrent readers and keeps its results cached", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const { driver, reads } = fakeDriver(
+        (_, reference) => reference.toUpperCase(),
+        () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      );
+      yield* Effect.gen(function* () {
+        const resolver = yield* SecretResolver.SecretResolver;
+        const first = yield* Effect.forkChild(resolver.read([ref("fake://a"), ref("fake://b")]));
+        yield* Deferred.await(started);
+        const second = yield* Effect.forkChild(resolver.read([ref("fake://b"), ref("fake://a")]), {
+          startImmediately: true,
+        });
+        yield* Deferred.succeed(release, undefined);
+        assert.deepStrictEqual(yield* Fiber.join(first), ["FAKE://A", "FAKE://B"]);
+        assert.deepStrictEqual(yield* Fiber.join(second), ["FAKE://B", "FAKE://A"]);
+        assert.deepStrictEqual(yield* resolver.read([ref("fake://a")]), ["FAKE://A"]);
+        assert.deepStrictEqual(reads, [{ account: "a", references: ["fake://a", "fake://b"] }]);
+      }).pipe(Effect.provide(resolverLayer(driver)));
+    }),
+  );
+
   it.effect("invalidates every reference when none are named", () => {
     const { driver, reads } = fakeDriver(() => "sk-live");
     return Effect.gen(function* () {

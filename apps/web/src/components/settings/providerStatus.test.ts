@@ -22,6 +22,17 @@ const provider: ServerProvider = {
 };
 
 describe("getProviderSummary", () => {
+  it("does not report an unprobed, unavailable provider as a missing CLI", () => {
+    expect(
+      getProviderSummary({
+        ...provider,
+        installed: false,
+        status: "error",
+        availability: "unavailable",
+        unavailableReason: "Could not read a secret.",
+      }),
+    ).toEqual({ headline: "Unavailable", detail: "Could not read a secret." });
+  });
   it("does not hide a provider error behind a previous authenticated state", () => {
     expect(
       getProviderSummary({
