@@ -416,7 +416,8 @@ jobs:
         run: |
           extra_args=()
           if [[ "${{ github.repository }}" != "pingdotgg/t3code" ]]; then
-            extra_args+=(--maxWorkers=2)
+            # Full-app browser tests compete for CPU on standard hosted runners.
+            extra_args+=(--maxWorkers=1)
           fi
           vp run --filter @t3tools/web test --shard ${{ matrix.shard }}/${{ strategy.job-total }} "${extra_args[@]}"
 
@@ -426,7 +427,6 @@ jobs:
   # isolation that flag buys is preserved exactly. One file at a time keeps
   # about 1.5 cores busy, so 4 vCPU runners lose nothing against 8. The shards
   # split files by recorded duration (apps/server/src/testUtils/weightedShardSequencer.ts).
-  # The shards are the longest jobs, so they gate themselves instead of waiting
   test_server:
     permissions:
       contents: read
