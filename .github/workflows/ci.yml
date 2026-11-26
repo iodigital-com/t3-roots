@@ -321,7 +321,7 @@ jobs:
 
   # The web suite is the largest outside the server. In the shared Test job it
   # started last and ran alone for about 40s after everything else finished.
-  # Two shards retain the complete suite while reducing runner setup costs.
+  # Four shards keep browser runs shorter on the fork after two-shard connection failures.
   test_web:
     permissions:
       contents: read
@@ -330,11 +330,11 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
     runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
-    timeout-minutes: 35
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: ${{ github.repository == 'pingdotgg/t3code' && fromJSON('[1, 2]') || fromJSON('[1, 2, 3, 4]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
