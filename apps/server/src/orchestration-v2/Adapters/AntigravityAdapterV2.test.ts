@@ -1039,6 +1039,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
   detachedChildProfile?: string,
   /** agy 1.5.11 answers a steered prompt once the next one arrives, which runs to `releaseSteer`. */
   steering?: { readonly agentVersion: string; readonly holdsFirstPrompt: boolean },
+  timer?: boolean,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -1053,12 +1054,19 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
     sessionUpdate === undefined
       ? Effect.die("the adapter must handle session updates")
       : sessionUpdate(normalizeAntigravitySessionUpdate({ sessionId: "mock-session-1", update }));
-  const command = {
-    toolCallId: "call_fetch",
-    kind: "execute",
-    title: "node fetch_throughput.mjs",
-    rawInput: { CommandLine: "node fetch_throughput.mjs", ...commandInput },
-  } as const;
+  const command = timer
+    ? {
+        toolCallId: "call_timer",
+        kind: "other",
+        title: "Run schedule",
+        rawInput: { DurationSeconds: 3, Prompt: "Timer completed.", ...commandInput },
+      }
+    : {
+        toolCallId: "call_fetch",
+        kind: "execute",
+        title: "node fetch_throughput.mjs",
+        rawInput: { CommandLine: "node fetch_throughput.mjs", ...commandInput },
+      };
   let cancels = 0;
   const prompts: Array<{
     readonly prompt: ReadonlyArray<EffectAcpSchema.ContentBlock>;
@@ -1252,6 +1260,41 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
 });
 
 describe("AntigravityAdapterV2 work after the prompt ends", () => {
+  it.effect("keeps a one-shot timer's run open through its wakeup reply", () =>
+    Effect.gen(function* () {
+      const { command, offers, send, startTurn, throughPromptSettled, throughTerminal } =
+        yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+      yield* startTurn(1, false);
+      yield* throughPromptSettled;
+      yield* TestClock.adjust("10 seconds");
+      yield* send({ sessionUpdate: "tool_call_update", ...command, status: "completed" });
+      assert.lengthOf(offers, 0, "the timer must still belong to the open run");
+      yield* send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Timer completed." },
+      });
+      yield* TestClock.adjust("2 minutes");
+      const run = yield* throughTerminal;
+      const terminal = run.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+      assert.include(JSON.stringify(run), "Timer completed.");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("does not hold a run open for a recurring daemon schedule", () =>
+    Effect.gen(function* () {
+      const { startTurn, throughTerminal } = yield* openSessionWithRunningCommand(
+        { DurationSeconds: undefined, CronExpression: "* * * * *", IsDaemon: true },
+        undefined,
+        undefined,
+        true,
+      );
+      yield* startTurn(1, false);
+      const terminal = (yield* throughTerminal).at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
   // agy sets `IsDaemon` on a command it does not wait for. When it exits, the agent replies
   // with no prompt open.
   it.effect("continues in one run when a finished daemon wakes the agent", () =>
@@ -1617,14 +1660,20 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
 
   it.effect.each([
     // session/cancel ends the agent's commands, so only Stop may send it.
-    { ending: "Stop", cancels: 1, status: "interrupted" },
-    { ending: "a new message", cancels: 0, status: "interrupted" },
-    { ending: "the agent exiting", cancels: 0, status: "failed" },
+    { ending: "Stop", cancels: 1, status: "interrupted", timer: false },
+    { ending: "Stop", cancels: 1, status: "interrupted", timer: true },
+    { ending: "a new message", cancels: 0, status: "interrupted", timer: false },
+    { ending: "the agent exiting", cancels: 0, status: "failed", timer: false },
   ] as const)(
-    "ends a run held open by a running command on $ending",
-    ({ ending, cancels, status }) =>
+    "ends a run held open by background work on $ending (timer: $timer)",
+    ({ ending, cancels, status, timer }) =>
       Effect.gen(function* () {
-        const opened = yield* openSessionWithRunningCommand({ WaitMsBeforeAsync: 10000 });
+        const opened = yield* openSessionWithRunningCommand(
+          timer ? {} : { WaitMsBeforeAsync: 10000 },
+          undefined,
+          undefined,
+          timer,
+        );
         yield* opened.startTurn(1, false);
         const started = yield* opened.throughPromptSettled;
         const turn = started.find((event) => event.type === "provider_turn.updated");
