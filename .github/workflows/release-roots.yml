@@ -1,18 +1,25 @@
 # Builds unsigned Windows x64 and ad-hoc signed macOS (arm64 + x64) installers into a draft fork release.
-# Start by pushing a tag such as v0.1.10-roots.8 on the patched commit.
-# Publishing the resulting draft needs Vincent's OK for that exact release.
+# Dispatch from main with an existing release tag and a concise changelog.
+# Publishing the resulting draft is a separate manual decision.
 name: Roots release
 
 on:
-  push:
-    tags:
-      - "v*-roots.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag on main (vX.Y.Z-roots.N)
+        required: true
+        type: string
+      changelog:
+        description: Concise release changelog
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: roots-release-${{ github.ref }}
+  group: roots-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 defaults:
@@ -26,7 +33,7 @@ env:
 
 jobs:
   cli:
-    if: github.repository == 'iodigital-com/t3-roots' || github.repository == 'vincentvermeire/t3-roots'
+    if: github.repository == 'iodigital-com/t3-roots' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
@@ -41,25 +48,31 @@ jobs:
         env:
           GIT_TERMINAL_PROMPT: "0"
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          CHANGELOG: ${{ inputs.changelog }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-roots\.[0-9]+$ ]]
+          [[ "$CHANGELOG" =~ [^[:space:]] ]]
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           git init .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --tags origin "$GITHUB_SHA"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
-          git checkout --detach "$GITHUB_SHA"
+          git checkout --detach "refs/tags/$RELEASE_TAG"
+          git merge-base --is-ancestor HEAD "$GITHUB_SHA"
 
       - name: Read release version and base
         id: meta
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-roots\.[0-9]+$ ]]
-          upstream_tag=${GITHUB_REF_NAME%%-roots.*}
+          upstream_tag=${RELEASE_TAG%%-roots.*}
           git fetch --no-tags https://github.com/pingdotgg/t3code.git "refs/tags/$upstream_tag"
           git merge-base --is-ancestor FETCH_HEAD HEAD
           commit=$(git rev-parse HEAD)
-          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
           echo "upstream_tag=$upstream_tag" >> "$GITHUB_OUTPUT"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
@@ -118,7 +131,7 @@ jobs:
 
   windows:
     needs: cli
-    if: github.repository == 'iodigital-com/t3-roots' || github.repository == 'vincentvermeire/t3-roots'
+    if: github.repository == 'iodigital-com/t3-roots' && github.ref == 'refs/heads/main'
     runs-on: windows-2025
     timeout-minutes: 90
     env:
@@ -134,7 +147,7 @@ jobs:
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           git init .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "${{ needs.cli.outputs.commit }}"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
 
@@ -202,7 +215,7 @@ jobs:
 
   mac_arm64:
     needs: cli
-    if: github.repository == 'iodigital-com/t3-roots' || github.repository == 'vincentvermeire/t3-roots'
+    if: github.repository == 'iodigital-com/t3-roots' && github.ref == 'refs/heads/main'
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -218,7 +231,7 @@ jobs:
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           git init .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "${{ needs.cli.outputs.commit }}"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
 
@@ -268,7 +281,7 @@ jobs:
 
   mac_x64:
     needs: cli
-    if: github.repository == 'iodigital-com/t3-roots' || github.repository == 'vincentvermeire/t3-roots'
+    if: github.repository == 'iodigital-com/t3-roots' && github.ref == 'refs/heads/main'
     runs-on: macos-15-intel
     timeout-minutes: 90
     env:
@@ -284,7 +297,7 @@ jobs:
           auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           git init .
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
-          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git -c "http.${GITHUB_SERVER_URL}/.extraheader=AUTHORIZATION: basic ${auth}" fetch --no-tags --depth=1 origin "${{ needs.cli.outputs.commit }}"
           git sparse-checkout set --no-cone '/*' '!/.repos/'
           git -c checkout.workers=0 checkout --detach FETCH_HEAD
 
@@ -334,7 +347,7 @@ jobs:
 
   release:
     needs: [cli, windows, mac_arm64, mac_x64]
-    if: github.repository == 'iodigital-com/t3-roots' || github.repository == 'vincentvermeire/t3-roots'
+    if: github.repository == 'iodigital-com/t3-roots' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -378,9 +391,12 @@ jobs:
       - name: Refuse to modify an already published release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_COMMIT: ${{ needs.cli.outputs.commit }}
         run: |
           set -euo pipefail
+          resolved=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          [[ "$resolved" == "$RELEASE_COMMIT" ]] || { echo 'Release tag moved during the build.' >&2; exit 1; }
           published=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[] | select(.tag_name == env.RELEASE_TAG and .draft == false) | .id')
           [[ -z "$published" ]] || { echo 'This tag already has a published release.' >&2; exit 1; }
 
@@ -388,14 +404,10 @@ jobs:
         uses: softprops/action-gh-release@40c2ca6ddd77ba2a30bbea8f67409c0f76868d67 # v3
         with:
           repository: ${{ github.repository }}
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag }}
           target_commitish: ${{ needs.cli.outputs.commit }}
-          name: T3 Roots ${{ github.ref_name }}
-          body: |
-            Based on upstream tag ${{ needs.cli.outputs.upstream_tag }}.
-            Fork commit ${{ needs.cli.outputs.commit }}.
-
-            Unsigned Windows x64 installer and ad-hoc signed macOS (arm64 + x64) DMG/ZIP archives. Publishing this draft needs Vincent's OK.
+          name: T3 Roots ${{ inputs.tag }}
+          body: ${{ inputs.changelog }}
           draft: true
           prerelease: false
           make_latest: false

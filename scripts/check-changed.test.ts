@@ -199,6 +199,19 @@ describe("check:changed", () => {
     });
   });
 
+  it("selects Windows checks for desktop and secret bridge changes, and fails open", () => {
+    const packages = readWorkspace();
+    for (const file of [
+      "apps/desktop/src/updates/DesktopUpdates.ts",
+      "packages/secret-provider-onepassword/src/server/driver.ts",
+      "packages/shared/src/HostProcess.ts",
+      "pnpm-lock.yaml",
+    ])
+      assert.isTrue(decide([file], packages, false).outputs.windows, file);
+    assert.isFalse(decide(["docs/user/install.md"], packages, false).outputs.windows);
+    assert.isTrue(decide(null, packages, false).outputs.windows);
+  });
+
   it("opens the built desktop app only for startup, settlement, and sidebar changes", () => {
     const packages = readWorkspace();
     const launches = (file: string) => decide([file], packages, false).outputs.desktop_launch;
