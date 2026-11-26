@@ -322,34 +322,74 @@ it.each([
     repository: "owner/other",
     expected: "squash",
   },
-])("merges a linked pull request with $name", async ({ thread, repository, expected }) => {
-  await using screen = await setup();
-  state.mergeMethods = ["merge", "squash", "rebase"];
-  state.projects = [scratchProject, repositoryProject, repositoryClone];
-  state.projectMergeMethods = { scratch: "squash", repository: "rebase", clone: "merge" };
-  useUiStateStore.getState().setPullRequestMergeMethod("squash");
-  state.pullRequests = [
-    {
-      host: "github.com",
-      repository,
-      number: 1,
-      url: `https://github.com/${repository}/pull/1`,
-      source: "manual",
-      linkedAt: "2026-10-30T00:00:00.000Z",
-      snapshot: null,
-      stack: null,
-    },
-  ];
-  await act(async () => {
-    await screen.rerender(
-      <ThreadDetailsThreadPrRows threadRef={threadRef} project={thread as never} />,
+  {
+    name: "the branch request's own repository alongside a linked fork with the same number",
+    thread: repositoryClone,
+    repository: "owner/upstream",
+    expected: "merge",
+    branchUrl: "https://github.com/owner/upstream/pull/1",
+    host: "github.com",
+  },
+  {
+    name: "the branch request's other host alongside a linked request with the same number",
+    thread: repositoryClone,
+    repository: "owner/upstream",
+    expected: "merge",
+    branchUrl: "https://gitlab.example.com/owner/upstream/-/merge_requests/1",
+    host: "gitlab.example.com",
+  },
+])(
+  "merges a linked pull request with $name",
+  async ({ thread, repository, expected, branchUrl, host }) => {
+    await using screen = await setup();
+    state.mergeMethods = ["merge", "squash", "rebase"];
+    state.projects = [scratchProject, repositoryProject, repositoryClone];
+    state.projectMergeMethods = { scratch: "squash", repository: "rebase", clone: "merge" };
+    useUiStateStore.getState().setPullRequestMergeMethod("squash");
+    state.pullRequests = [
+      {
+        host: "github.com",
+        repository: branchUrl ? "owner/repo" : repository,
+        number: 1,
+        url: `https://github.com/${branchUrl ? "owner/repo" : repository}/pull/1`,
+        source: "manual",
+        linkedAt: "2026-10-30T00:00:00.000Z",
+        snapshot: null,
+        stack: null,
+      },
+    ];
+    await act(async () => {
+      await screen.rerender(
+        <ThreadDetailsThreadPrRows
+          threadRef={threadRef}
+          project={thread as never}
+          {...(branchUrl
+            ? {
+                branchPr: {
+                  number: 1,
+                  title: "Branch request",
+                  url: branchUrl,
+                  state: "open" as const,
+                  headRef: "feature",
+                  baseRef: "main",
+                },
+              }
+            : {})}
+        />,
+      );
+    });
+    await clickButton(screen.container, "Merge");
+    expect(document.querySelector('[role="alertdialog"]')!.textContent).toContain(
+      `using ${expected}`,
     );
-  });
-  await clickButton(screen.container, "Merge");
-  expect(document.querySelector('[role="alertdialog"]')!.textContent).toContain(
-    `using ${expected}`,
-  );
-});
+    await clickButton(document.querySelector('[role="alertdialog"]')!, "Merge");
+    expect(state.perform).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({ host: host ?? "github.com", repository, number: 1 }),
+      }),
+    );
+  },
+);
 
 it("names a linked pull request row by its kind, number and title, not its URL", async () => {
   await using screen = await setup();

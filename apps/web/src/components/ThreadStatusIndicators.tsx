@@ -1,4 +1,5 @@
 import { pipe } from "effect/Function";
+import { useAtomMount } from "@effect/atom-react";
 import { changeRequestTermKind, type ChangeRequestTermKind } from "./pullRequest/changeRequestTerm";
 import {
   scopeProjectRef,
@@ -41,7 +42,7 @@ import { revealThreadTerminal } from "../lib/revealThreadTerminal";
 import { useEnvironmentQuery } from "../state/query";
 import { linkedPullRequestDetailAtom, useSharedPullRequestSummary } from "../state/pullRequests";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
-import { vcsEnvironment } from "../state/vcs";
+import { vcsEnvironment, vcsBranchRevalidation } from "../state/vcs";
 import { useUiStateStore } from "../uiStateStore";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import {
@@ -926,11 +927,28 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     thread.pullRequests,
     gitCwd === null ? thread.branchPullRequest : undefined,
   );
-  const gitStatus = useEnvironmentQuery(
+  const branchTarget =
     leaseLiveStatus && gitCwd !== null
+      ? { environmentId: thread.environmentId, cwd: gitCwd }
+      : null;
+  const branchStatus = useEnvironmentQuery(
+    branchTarget === null
+      ? null
+      : vcsEnvironment.branch({
+          environmentId: branchTarget.environmentId,
+          input: { cwd: branchTarget.cwd },
+        }),
+  );
+  useAtomMount(vcsBranchRevalidation(branchTarget));
+  const visibleBranchStatus = useRetainedValue(
+    JSON.stringify([thread.environmentId, gitCwd]),
+    branchStatus.data,
+  );
+  const gitStatus = useEnvironmentQuery(
+    branchTarget !== null
       ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd },
+          environmentId: branchTarget.environmentId,
+          input: { cwd: branchTarget.cwd },
         })
       : null,
   );
@@ -939,9 +957,8 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     gitStatus.data,
   );
   const displayedPrInput = {
-    threadBranch: thread.branch,
+    threadBranch: visibleBranchStatus?.refName ?? null,
     gitStatus: visibleGitStatus,
-    followCheckout: true,
   };
   const pr = resolveDisplayedThreadPr(displayedPrInput) ?? linkedPullRequest?.pr ?? null;
   const prStatus = prStatusIndicator(

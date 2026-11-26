@@ -16,6 +16,7 @@ import { AppAtomRegistryProvider } from "../../rpc/atomRegistry";
 import { useRightPanelStore } from "../../rightPanelStore";
 import { makeThreadFixture } from "../../test-fixtures";
 import { SortableThreadRow } from "./SidebarThreadRow";
+import { ThreadRowLeadingStatus } from "../ThreadStatusIndicators";
 
 const state = vi.hoisted(() => ({
   branch: null as unknown,
@@ -279,4 +280,24 @@ it("opens a single sidebar PR on the pull requests page when no thread is open",
   expect(state.navigate).toHaveBeenCalledWith(expect.objectContaining({ to: "/pull-requests" }));
   expect(activate).not.toHaveBeenCalled();
   expect(useRightPanelStore.getState().byThreadKey).toEqual({});
+});
+
+it("palette clears the old request while the new branch's full status is delayed", async () => {
+  setup();
+  const palette = () => (
+    <AppAtomRegistryProvider>
+      <ThreadRowLeadingStatus thread={{ ...thread, worktreePath: project.workspaceRoot }} />
+    </AppAtomRegistryProvider>
+  );
+  await using screen = await render(palette());
+  await expect.element(screen.getByLabelText(/PR #1/)).toBeVisible();
+  state.branch = { isRepo: true, refName: "b" };
+  await screen.rerender(palette());
+  await expect.element(screen.getByLabelText(/PR #1/)).not.toBeInTheDocument();
+  state.status = gitStatus("b", pr(2, "b"));
+  await screen.rerender(palette());
+  await expect.element(screen.getByLabelText(/PR #2/)).toBeVisible();
+  state.status = gitStatus("b", null);
+  await screen.rerender(palette());
+  await expect.element(screen.getByLabelText(/PR #2/)).not.toBeInTheDocument();
 });
