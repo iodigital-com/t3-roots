@@ -610,7 +610,7 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
       Effect.provideService(SecureRandom.SecureRandom, random),
       Effect.mapError(() => customError()),
     );
-  const customCache = new Map<string, { fingerprint: string; version: string }>();
+  const customCache = new Map<string, string>();
   const verifyCustom = Effect.fn("AntigravityInstallation.verifyCustom")(function* (
     executable: AntigravityExecutable,
     realPath: string,
@@ -627,22 +627,23 @@ export const makeAntigravityInstallation = Effect.fn("AntigravityInstallation.ma
     }
     const envHash = hasher.digest("hex");
     const fingerprint = `${realPath}:${info.size}:${Option.getOrUndefined(info.mtime)?.getTime()}:${Option.getOrUndefined(info.ino)}:${envHash}`;
-    const cached = customCache.get(executable.executablePath);
-    const version =
-      cached?.fingerprint === fingerprint
-        ? cached.version
-        : yield* validateExternal(executable, baseEnv).pipe(
-            Effect.scoped,
-            Effect.timeout(VALIDATION_TIMEOUT),
-            Effect.mapError(() => customError()),
-          );
+    const cacheKey = `${executable.executablePath}:${fingerprint}`;
+    let version = customCache.get(cacheKey);
+    if (version === undefined || (yield* isWithdrawn(version))) {
+      customCache.delete(cacheKey);
+      version = yield* validateExternal(executable, baseEnv).pipe(
+        Effect.scoped,
+        Effect.timeout(VALIDATION_TIMEOUT),
+        Effect.mapError(() => customError()),
+      );
+    }
     if (yield* isWithdrawn(version)) {
       return yield* installationError(
         "resolve",
         `Antigravity ${version} no longer works with this T3 Code release. Update the custom executable.`,
       );
     }
-    customCache.set(executable.executablePath, { fingerprint, version });
+    customCache.set(cacheKey, version);
     return { ...executable, version };
   });
 

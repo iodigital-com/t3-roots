@@ -291,6 +291,22 @@ it.live("verifies a custom launcher by ACP identity and caches the result", () =
       args: ReadonlyArray<string>;
       env: NodeJS.ProcessEnv;
     }> = [];
+    let reportedVersion = "1.5.12";
+    let withdrawn = false;
+    const manifest = Effect.sync(() =>
+      withdrawn
+        ? ({
+            ...ModelManifest.BUNDLED_MODEL_MANIFEST,
+            compatibility: [
+              {
+                driver: "antigravity",
+                t3CodeRange: ">=0.0.42",
+                ranges: [{ range: "=1.5.12", status: "broken" }],
+              },
+            ],
+          } satisfies ModelManifest.ModelManifestData)
+        : ModelManifest.BUNDLED_MODEL_MANIFEST,
+    );
     const spawner = ChildProcessSpawner.make((command) => {
       if (
         !ChildProcess.isStandardCommand(command) ||
@@ -312,12 +328,13 @@ it.live("verifies a custom launcher by ACP identity and caches the result", () =
       const script =
         command.command === broken
           ? "process.stderr.write('fixture-secret'); process.exit(1);"
-          : `require('readline').createInterface({input:process.stdin}).on('line', line => { const request=JSON.parse(line); if(request.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:1,agentInfo:{name:${JSON.stringify(name)},version:'1.5.12'},agentCapabilities:{},authMethods:[]}})+'\\n'); });`;
+          : `require('readline').createInterface({input:process.stdin}).on('line', line => { const request=JSON.parse(line); if(request.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:1,agentInfo:{name:${JSON.stringify(name)},version:${JSON.stringify(reportedVersion)}},agentCapabilities:{},authMethods:[]}})+'\\n'); });`;
       return actualSpawner.spawn(ChildProcess.make(node, ["-e", script], command.options));
     });
     const { installation } = yield* makeHarness({
       baseDir,
       spawner,
+      manifest,
       environment: { ...env, GEMINI_API_KEY: "fixture-secret", CUSTOM_PROBE: "fixture-env" },
       path: env.PATH ?? "",
       useDefaultExternalValidation: true,
@@ -343,6 +360,13 @@ it.live("verifies a custom launcher by ACP identity and caches the result", () =
     expect(commands.filter((command) => command.command === good)).toHaveLength(2);
     yield* installation.resolve(good, { ...env, CUSTOM_PROBE: "changed-env" });
     expect(commands.filter((command) => command.command === good)).toHaveLength(3);
+    yield* installation.resolve(good);
+    yield* installation.resolve(good, { ...env, CUSTOM_PROBE: "changed-env" });
+    expect(commands.filter((command) => command.command === good)).toHaveLength(3);
+    reportedVersion = "1.5.13";
+    withdrawn = true;
+    expect((yield* installation.resolve(good)).version).toBe("1.5.13");
+    expect(commands.filter((command) => command.command === good)).toHaveLength(4);
     const error = yield* installation.resolve(bad).pipe(Effect.flip);
     expect(error.detail).toMatch(/custom Antigravity.*agy CLI/i);
     const brokenError = yield* installation.resolve(broken).pipe(Effect.flip);
