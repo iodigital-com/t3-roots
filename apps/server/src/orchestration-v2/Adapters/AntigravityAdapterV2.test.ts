@@ -8,6 +8,7 @@ import {
   ProjectId,
   ProviderInstanceId,
   ProviderSessionId,
+  ProviderTurnId,
   RunAttemptId,
   RunId,
   ThreadId,
@@ -37,6 +38,12 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
+import {
+  backgroundStep,
+  makeProfile,
+  plannerReplyStep,
+  putStep,
+} from "../../provider/acp/AntigravityChildWork.testkit.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -1040,6 +1047,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
   /** agy 1.5.11 answers a steered prompt once the next one arrives, which runs to `releaseSteer`. */
   steering?: { readonly agentVersion: string; readonly holdsFirstPrompt: boolean },
   timer?: boolean,
+  useCommandWithProfile?: boolean,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -1124,7 +1132,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
                 return { stopReason: "end_turn" as const };
               }
               yield* send(
-                detachedChildProfile === undefined
+                detachedChildProfile === undefined || useCommandWithProfile
                   ? { sessionUpdate: "tool_call", ...command, status: "in_progress" }
                   : {
                       sessionUpdate: "tool_call",
@@ -1262,22 +1270,55 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
 describe("AntigravityAdapterV2 work after the prompt ends", () => {
   it.effect("keeps a one-shot timer's run open through its wakeup reply", () =>
     Effect.gen(function* () {
+      const { profile, databasePath } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [[3, 15, plannerReplyStep(3)]],
+      });
       const { command, offers, send, startTurn, throughPromptSettled, throughTerminal } =
-        yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+        yield* openSessionWithRunningCommand({}, profile, undefined, true, true);
       yield* startTurn(1, false);
       yield* throughPromptSettled;
       yield* TestClock.adjust("10 seconds");
       yield* send({ sessionUpdate: "tool_call_update", ...command, status: "completed" });
       assert.lengthOf(offers, 0, "the timer must still belong to the open run");
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "older reply"));
       yield* send({
         sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: "Timer completed." },
+        content: { type: "text", text: "Timer " },
       });
-      yield* TestClock.adjust("2 minutes");
-      const run = yield* throughTerminal;
+      yield* TestClock.adjust("3 seconds");
+      const terminalFiber = yield* throughTerminal.pipe(Effect.forkScoped);
+      assert.isUndefined(terminalFiber.pollUnsafe(), "an older reply must not settle the wake");
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer almost ", true));
+      yield* send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "almost " },
+      });
+      yield* TestClock.adjust("3 seconds");
+      assert.isUndefined(
+        terminalFiber.pollUnsafe(),
+        "a reply that calls a tool must remain active",
+      );
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(8, "Timer almost done "));
+      yield* send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "done " },
+      });
+      yield* TestClock.adjust("3 seconds");
+      assert.isUndefined(
+        terminalFiber.pollUnsafe(),
+        "a pause in a running reply must not settle it",
+      );
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer almost done completed."));
+      yield* send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "completed." },
+      });
+      yield* TestClock.adjust("3 seconds");
+      const run = yield* Fiber.join(terminalFiber);
       const terminal = run.at(-1);
       assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
-      assert.include(JSON.stringify(run), "Timer completed.");
+      assert.include(JSON.stringify(run), "Timer almost done completed.");
     }).pipe(Effect.provide(layerSession)),
   );
 
@@ -1292,6 +1333,217 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
       yield* startTurn(1, false);
       const terminal = (yield* throughTerminal).at(-1);
       assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect.each([false, true])(
+    "fails if the runtime exits during a timer wake (reply started: %s)",
+    (replyStarted) =>
+      Effect.gen(function* () {
+        const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+        yield* opened.startTurn(1, false);
+        yield* opened.throughPromptSettled;
+        yield* opened.send({
+          sessionUpdate: "tool_call_update",
+          ...opened.command,
+          status: "completed",
+        });
+        if (replyStarted) {
+          yield* opened.send({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Answer" },
+          });
+        }
+        yield* opened.runtimeDies;
+        const terminal = (yield* opened.throughTerminal).at(-1);
+        assert.equal(terminal?.type === "turn.terminal" && terminal.status, "failed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("keeps a live timer in the replacement run without cancelling concurrent work", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profile = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-carry-" });
+      const records = (session: string, kind: string) =>
+        path.join(profile, "antigravity-acp", "brain", session, ".system_generated", kind);
+      const write = (directory: string, name: string, value: unknown) =>
+        fs
+          .makeDirectory(directory, { recursive: true })
+          .pipe(
+            Effect.andThen(fs.writeFileString(path.join(directory, name), JSON.stringify(value))),
+          );
+      yield* write(records("mock-session-1", "subagents"), "child-1.json", {});
+      yield* write(records("child-1", "messages"), "launch.json", {
+        sender: "mock-session-1",
+        sourceMetadata: { tool: { toolCall: { id: "call_child", name: "invoke_subagent" } } },
+      });
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true);
+      yield* opened.startTurn(1, false);
+      const events = yield* opened.throughPromptSettled;
+      const turn = events.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      yield* opened.send({
+        sessionUpdate: "tool_call",
+        toolCallId: "call_child",
+        kind: "other",
+        title: "Run invoke_subagent",
+        status: "completed",
+        rawInput: { Role: "Researcher", Prompt: "Check" },
+      });
+      yield* opened.send({
+        sessionUpdate: "tool_call",
+        toolCallId: "call_command",
+        kind: "execute",
+        title: "fixture",
+        status: "in_progress",
+        rawInput: { CommandLine: "fixture" },
+      });
+      yield* opened.session.interruptTurn({
+        providerThread: opened.providerThread,
+        providerTurnId: turn.providerTurn.id,
+      });
+      const interrupted = yield* opened.throughTerminal;
+      assert.isFalse(
+        interrupted.some(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
+        ),
+      );
+      assert.equal(opened.cancels(), 0);
+      yield* opened.startTurn(2, false);
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Still waiting." },
+      });
+      yield* opened.send(opened.usage);
+      yield* opened.releaseSteer;
+      yield* opened.throughPromptSettled;
+      yield* TestClock.adjust("10 minutes");
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "call_command",
+        kind: "execute",
+        title: "fixture",
+        status: "completed",
+        rawInput: { CommandLine: "fixture" },
+      });
+      assert.lengthOf(opened.offers, 0);
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Timer completed." },
+      });
+      yield* write(records("mock-session-1", "messages"), "report.json", { sender: "child-1" });
+      yield* opened.send(opened.usage);
+      yield* TestClock.adjust("3 seconds");
+      const result = yield* opened.throughTerminal;
+      assert.include(JSON.stringify(result), "Timer completed.");
+      assert.equal(result.at(-1)?.type, "turn.terminal");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("Stop cancels a timer between the interrupted and replacement runs", () =>
+    Effect.gen(function* () {
+      const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+      yield* opened.startTurn(1, false);
+      const events = yield* opened.throughPromptSettled;
+      const turn = events.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      const input = { providerThread: opened.providerThread, providerTurnId: turn.providerTurn.id };
+      yield* opened.session.interruptTurn(input);
+      yield* opened.throughTerminal;
+      yield* opened.session.interruptTurn({
+        ...input,
+        providerTurnId: ProviderTurnId.make("unrelated-turn"),
+        requestRuntimeRestart: true,
+      });
+      assert.equal(opened.cancels(), 0, "a stale Stop must not cancel this timer");
+      yield* opened.session.interruptTurn({ ...input, requestRuntimeRestart: true });
+      assert.equal(opened.cancels(), 1);
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "stale wake" },
+      });
+      assert.lengthOf(opened.offers, 0);
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("does not carry a timer that finished before the replacement run", () =>
+    Effect.gen(function* () {
+      const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+      yield* opened.startTurn(1, false);
+      const events = yield* opened.throughPromptSettled;
+      const turn = events.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      yield* opened.session.interruptTurn({
+        providerThread: opened.providerThread,
+        providerTurnId: turn.providerTurn.id,
+      });
+      yield* opened.throughTerminal;
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      assert.lengthOf(opened.offers, 1);
+      yield* opened.startTurn(2, false);
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "New message answered." },
+      });
+      yield* opened.send(opened.usage);
+      yield* opened.releaseSteer;
+      const terminal = (yield* opened.throughTerminal).at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("Stop cancels a timer carried into the replacement run", () =>
+    Effect.gen(function* () {
+      const opened = yield* openSessionWithRunningCommand({}, undefined, undefined, true);
+      yield* opened.startTurn(1, false);
+      const first = yield* opened.throughPromptSettled;
+      const oldTurn = first.find((event) => event.type === "provider_turn.updated");
+      if (oldTurn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      yield* opened.session.interruptTurn({
+        providerThread: opened.providerThread,
+        providerTurnId: oldTurn.providerTurn.id,
+      });
+      yield* opened.throughTerminal;
+      yield* opened.startTurn(2, false);
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Waiting." },
+      });
+      yield* opened.send(opened.usage);
+      yield* opened.releaseSteer;
+      const replacement = yield* opened.throughPromptSettled;
+      const turn = replacement.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the replacement must start");
+      yield* TestClock.adjust("10 minutes");
+      yield* opened.session.interruptTurn({
+        providerThread: opened.providerThread,
+        providerTurnId: turn.providerTurn.id,
+        requestRuntimeRestart: true,
+      });
+      const terminal = (yield* opened.throughTerminal).at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "interrupted");
+      assert.equal(opened.cancels(), 1);
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      assert.lengthOf(opened.offers, 0);
     }).pipe(Effect.provide(layerSession)),
   );
 
@@ -1396,22 +1648,89 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
-  // agy names its background commands `<session>/task-<n>`; the agent passes that to
-  // t3_background_wait, which must not fail since the adapter already holds the run open.
-  it.effect("accepts t3_background_wait for a command it already tracks", () =>
+  it.effect("matches and clears only the requested native task", () =>
     Effect.gen(function* () {
-      const { session, providerThread, startTurn, throughPromptSettled } =
-        yield* openSessionWithRunningCommand({ WaitMsBeforeAsync: 10000 });
+      const { profile } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [
+          [2, 132, backgroundStep("call_fetch", "run_command", "mock-session-1/task-2")],
+          [3, 132, backgroundStep("call_other", "run_command", "mock-session-1/task-3")],
+          [4, 127, backgroundStep("call_child", "invoke_subagent", "mock-session-1/task-4")],
+          [5, 132, backgroundStep("call_fetch", "run_command", "mock-session-1/task-2")],
+          [6, 132, Uint8Array.from([255])],
+        ],
+      });
+      const {
+        session,
+        providerThread,
+        startTurn,
+        throughPromptSettled,
+        throughTerminal,
+        send,
+        usage,
+      } = yield* openSessionWithRunningCommand(
+        { WaitMsBeforeAsync: 10000 },
+        profile,
+        undefined,
+        false,
+        true,
+      );
       yield* startTurn(1, false);
       yield* throughPromptSettled;
-      const taskIds = ["mock-session-1/task-2"];
       assert.isDefined(session.awaitBackgroundTasks, "t3_background_wait must not be unsupported");
       const result = yield* session.awaitBackgroundTasks!({
         providerThread,
-        taskIds,
+        taskIds: [
+          "mock-session-1/task-2",
+          "mock-session-1/task-3",
+          "mock-session-1/task-4",
+          "mock-session-1/task-5",
+          "mock-session-1/task-6",
+          "other/task-2",
+        ],
         awaited: true,
       });
-      assert.deepEqual(result.matched, taskIds);
+      assert.deepEqual(result.matched, ["mock-session-1/task-2"]);
+      yield* send({
+        sessionUpdate: "tool_call",
+        toolCallId: "call_other",
+        kind: "execute",
+        title: "other",
+        status: "in_progress",
+        rawInput: { CommandLine: "other" },
+      });
+      yield* send(usage);
+      const cleared = yield* session.awaitBackgroundTasks!({
+        providerThread,
+        taskIds: ["mock-session-1/task-2", "mock-session-1/task-5"],
+        awaited: false,
+      });
+      assert.deepEqual(cleared.matched, ["mock-session-1/task-2"]);
+      const markedAgain = yield* session.awaitBackgroundTasks!({
+        providerThread,
+        taskIds: ["mock-session-1/task-2"],
+        awaited: true,
+      });
+      assert.deepEqual(markedAgain.matched, ["mock-session-1/task-2"]);
+      const terminalFiber = yield* throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("10 seconds");
+      assert.isUndefined(terminalFiber.pollUnsafe(), "marking again keeps the task awaited");
+      yield* session.awaitBackgroundTasks!({
+        providerThread,
+        taskIds: ["mock-session-1/task-2"],
+        awaited: false,
+      });
+      yield* TestClock.adjust("10 seconds");
+      assert.isUndefined(terminalFiber.pollUnsafe(), "clearing one task must not release another");
+      const last = yield* session.awaitBackgroundTasks!({
+        providerThread,
+        taskIds: ["mock-session-1/task-3"],
+        awaited: false,
+      });
+      assert.deepEqual(last.matched, ["mock-session-1/task-3"]);
+      yield* TestClock.adjust("3 seconds");
+      const terminal = (yield* Fiber.join(terminalFiber)).at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "completed");
     }).pipe(Effect.provide(layerSession)),
   );
 
