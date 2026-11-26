@@ -582,9 +582,7 @@ export const AntigravityDriver: ProviderDriver<
       codeLogin,
     });
 
-    // The probe must not spawn. The agent is a PyInstaller one-file bundle
-    // that unpacks about 1 GB per launch, and the health check runs every
-    // minute.
+    // Custom executable resolution caches its handshake: the runtime may unpack 1 GB per launch.
     const probe = Effect.gen(function* () {
       yield* modelCatalog.refreshInBackground;
       if (authConfigIssue !== null) {
