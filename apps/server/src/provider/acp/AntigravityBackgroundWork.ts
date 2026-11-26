@@ -2,6 +2,7 @@
 import * as NodeSqlite from "node:sqlite";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import type { AcpBackgroundReplyState } from "@t3tools/provider-acp/server/adapter";
 import { protoFields } from "./AntigravityChildWork.ts";
 import { antigravityManagedPath, antigravityProfileRoot } from "./AntigravityProfilePaths.ts";
 
@@ -94,26 +95,32 @@ const readLatestStep = (profileDirectory: string, sessionId: string) =>
     catch: (cause) => new AntigravityBackgroundReadError({ cause }),
   }).pipe(Effect.orElseSucceed(() => undefined));
 
-/** Only a later, completed planner step proves that the background reply has finished. */
+/** A completed planner step with matching text proves that the background reply has finished. */
 export const watchAntigravityBackgroundReply = Effect.fn("watchAntigravityBackgroundReply")(
   function* (profileDirectory: string, sessionId: string) {
     const before = yield* readLatestStep(profileDirectory, sessionId);
     return (reply: string) =>
       before === undefined
-        ? Effect.succeed(false)
+        ? Effect.succeed("unknown" as const)
         : readLatestStep(profileDirectory, sessionId).pipe(
-            Effect.map(
-              (step) =>
-                reply.trim().length > 0 &&
-                step !== undefined &&
-                step.dev === before.dev &&
-                step.ino === before.ino &&
-                step.index > before.index &&
-                step.type === 15 &&
-                step.status === 3 &&
+            Effect.map((step): AcpBackgroundReplyState => {
+              if (
+                step === undefined ||
+                step.dev !== before.dev ||
+                step.ino !== before.ino ||
+                step.index < before.index ||
+                (step.index === before.index && !(before.type === 15 && before.status === 8)) ||
+                step.type !== 15
+              )
+                return "unknown";
+              if (step.status === 8) return "running";
+              return step.status === 3 &&
                 !step.hasToolCalls &&
-                step.reply?.trim() === reply.trim(),
-            ),
+                reply.trim().length > 0 &&
+                step.reply?.trim() === reply.trim()
+                ? "completed"
+                : "unknown";
+            }),
           );
   },
 );

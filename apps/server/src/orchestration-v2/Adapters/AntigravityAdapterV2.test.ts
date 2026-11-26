@@ -16,8 +16,10 @@ import {
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
@@ -1048,6 +1050,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
   steering?: { readonly agentVersion: string; readonly holdsFirstPrompt: boolean },
   timer?: boolean,
   useCommandWithProfile?: boolean,
+  testHooks?: Parameters<typeof makeAntigravityAdapterV2>[0]["testHooks"],
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -1156,6 +1159,7 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
     },
     withProcess: (_stop, task) => task,
     defaultModel: Effect.undefined,
+    ...(testHooks === undefined ? {} : { testHooks }),
     ...(detachedChildProfile === undefined ? {} : { profileDirectory: detachedChildProfile }),
   });
   const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
@@ -1322,6 +1326,152 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
     }).pipe(Effect.provide(layerSession)),
   );
 
+  it.effect.each([
+    {
+      name: "when the record completes without another chunk",
+      remainsRunning: false,
+      unreadable: false,
+      alreadyRunning: false,
+    },
+    {
+      name: "while the record remains running past two minutes",
+      remainsRunning: true,
+      unreadable: false,
+      alreadyRunning: false,
+    },
+    {
+      name: "when a previously running record becomes unreadable",
+      remainsRunning: true,
+      unreadable: true,
+      alreadyRunning: false,
+    },
+    {
+      name: "when the watcher starts after the native reply started",
+      remainsRunning: false,
+      unreadable: false,
+      alreadyRunning: true,
+    },
+  ])("rechecks the native reply $name", ({ remainsRunning, unreadable, alreadyRunning }) =>
+    Effect.gen(function* () {
+      const { profile, databasePath } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () =>
+          alreadyRunning
+            ? [[5, 15, plannerReplyStep(8, "Timer completed.")]]
+            : [[3, 15, plannerReplyStep(3)]],
+      });
+      const scheduled = yield* Queue.unbounded<Duration.Input>();
+      const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+      const completed = yield* Deferred.make<void>();
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+        onDeferredFinalizeScheduled: (delay) => Queue.offer(scheduled, delay).pipe(Effect.asVoid),
+        onBackgroundReplyChecked: (state) =>
+          Queue.offer(checked, state).pipe(
+            Effect.andThen(
+              state === "completed" ? Deferred.succeed(completed, undefined) : Effect.void,
+            ),
+            Effect.asVoid,
+          ),
+      });
+      yield* opened.startTurn(1, false);
+      const started = yield* opened.throughPromptSettled;
+      const turn = started.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(8, "Timer completed."));
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Timer completed." },
+      });
+      yield* Queue.takeAll(scheduled);
+      const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), "running");
+      assert.equal(
+        Duration.toMillis(yield* Queue.take(scheduled)),
+        3000,
+        "a running reply must be checked again promptly",
+      );
+      if (unreadable) {
+        yield* (yield* FileSystem.FileSystem).remove(databasePath);
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "unknown");
+        assert.equal(Duration.toMillis(yield* Queue.take(scheduled)), 3000);
+      }
+      if (remainsRunning) {
+        yield* TestClock.adjust("2 minutes");
+        assert.isUndefined(
+          terminal.pollUnsafe(),
+          "a known-running reply must not settle on the quiet fallback",
+        );
+      }
+      if (unreadable) {
+        yield* opened.session.interruptTurn({
+          providerThread: opened.providerThread,
+          providerTurnId: turn.providerTurn.id,
+          requestRuntimeRestart: true,
+        });
+        const result = (yield* Fiber.join(terminal)).at(-1);
+        assert.equal(result?.type === "turn.terminal" && result.status, "interrupted");
+        return;
+      }
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer completed."));
+      yield* TestClock.adjust("3 seconds");
+      yield* Deferred.await(completed);
+      const result = (yield* Fiber.join(terminal)).at(-1);
+      assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("uses the quiet fallback when native reply evidence was never readable", () =>
+    Effect.gen(function* () {
+      const { profile } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [[3, 15, plannerReplyStep(3)]],
+      });
+      const scheduled = yield* Queue.unbounded<Duration.Input>();
+      const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+      const checkedAfterDeadline = yield* Deferred.make<void>();
+      let deadline = Number.POSITIVE_INFINITY;
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+        onDeferredFinalizeScheduled: (delay) => Queue.offer(scheduled, delay).pipe(Effect.asVoid),
+        onBackgroundReplyChecked: (state) =>
+          Effect.gen(function* () {
+            yield* Queue.offer(checked, state);
+            if (state === "unknown" && (yield* Clock.currentTimeMillis) >= deadline) {
+              yield* Deferred.succeed(checkedAfterDeadline, undefined);
+            }
+          }),
+      });
+      yield* opened.startTurn(1, false);
+      yield* opened.throughPromptSettled;
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Answer" },
+      });
+      deadline = (yield* Clock.currentTimeMillis) + 120_000;
+      yield* Queue.takeAll(scheduled);
+      const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), "unknown");
+      assert.equal(Duration.toMillis(yield* Queue.take(scheduled)), 3000);
+      assert.isUndefined(terminal.pollUnsafe());
+      yield* TestClock.adjust("2 minutes");
+      yield* Deferred.await(checkedAfterDeadline);
+      const result = (yield* Fiber.join(terminal)).at(-1);
+      assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
   it.effect("does not hold a run open for a recurring daemon schedule", () =>
     Effect.gen(function* () {
       const { startTurn, throughTerminal } = yield* openSessionWithRunningCommand(
@@ -1404,6 +1554,13 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
         providerTurnId: turn.providerTurn.id,
       });
       const interrupted = yield* opened.throughTerminal;
+      const terminal = interrupted.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "interrupted");
+      assert.isTrue(
+        terminal?.type === "turn.terminal" &&
+          "childTurnsContinue" in terminal &&
+          terminal.childTurnsContinue === true,
+      );
       assert.isFalse(
         interrupted.some(
           (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
@@ -1474,6 +1631,47 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
         content: { type: "text", text: "stale wake" },
       });
       assert.lengthOf(opened.offers, 0);
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("Stop interrupts a live native child instead of marking it as continuing", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profile = yield* fs.makeTempDirectoryScoped({ prefix: "t3-antigravity-stop-child-" });
+      const records = (session: string, kind: string) =>
+        path.join(profile, "antigravity-acp", "brain", session, ".system_generated", kind);
+      const write = (directory: string, name: string, value: unknown) =>
+        fs
+          .makeDirectory(directory, { recursive: true })
+          .pipe(
+            Effect.andThen(fs.writeFileString(path.join(directory, name), JSON.stringify(value))),
+          );
+      yield* write(records("mock-session-1", "subagents"), "child-1.json", {});
+      yield* write(records("child-1", "messages"), "launch.json", {
+        sender: "mock-session-1",
+        sourceMetadata: { tool: { toolCall: { id: "call_research", name: "invoke_subagent" } } },
+      });
+      const opened = yield* openSessionWithRunningCommand({}, profile);
+      yield* opened.startTurn(1, false);
+      const started = yield* opened.throughPromptSettled;
+      const turn = started.find((event) => event.type === "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+      yield* opened.session.interruptTurn({
+        providerThread: opened.providerThread,
+        providerTurnId: turn.providerTurn.id,
+        requestRuntimeRestart: true,
+      });
+      const events = yield* opened.throughTerminal;
+      const terminal = events.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" && terminal.status, "interrupted");
+      assert.notProperty(terminal, "childTurnsContinue");
+      assert.isTrue(
+        events.some(
+          (event) => event.type === "subagent.updated" && event.subagent.status === "interrupted",
+        ),
+      );
+      assert.equal(opened.cancels(), 1);
     }).pipe(Effect.provide(layerSession)),
   );
 
@@ -2008,6 +2206,7 @@ describe("AntigravityAdapterV2 work after the prompt ends", () => {
         }
         const terminal = (yield* opened.throughTerminal).at(-1);
         assert.equal(terminal?.type === "turn.terminal" && terminal.status, status);
+        if (ending === "Stop") assert.notProperty(terminal, "childTurnsContinue");
         assert.equal(opened.cancels(), cancels);
       }).pipe(Effect.provide(layerSession)),
   );

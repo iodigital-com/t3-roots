@@ -640,7 +640,7 @@ export interface AcpAdapterV2Flavor {
   ) => Effect.Effect<ReadonlyArray<{ readonly taskId: string; readonly toolCallId: string }>>;
   readonly watchBackgroundReply?: (
     sessionId: string,
-  ) => Effect.Effect<(reply: string) => Effect.Effect<boolean>>;
+  ) => Effect.Effect<(reply: string) => Effect.Effect<AcpBackgroundReplyState>>;
   readonly isProviderWakeNotification?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => boolean;
@@ -785,6 +785,7 @@ export interface AcpAdapterV2Options {
   };
   readonly testHooks?: {
     readonly onDeferredFinalizeScheduled?: (debounce: Duration.Input) => Effect.Effect<void>;
+    readonly onBackgroundReplyChecked?: (state: AcpBackgroundReplyState) => Effect.Effect<void>;
     /** `cancelAfterPromptStarts`: Stop is holding `session/cancel` until the prompt starts. */
     readonly onCancelHeld?: () => Effect.Effect<void>;
     readonly afterPromptWireSettled?: () => Effect.Effect<void>;
@@ -806,6 +807,8 @@ export interface AcpAdapterV2Options {
     }) => Effect.Effect<void>;
   };
 }
+
+export type AcpBackgroundReplyState = "running" | "completed" | "unknown";
 
 export const AcpProviderCapabilitiesV2 = {
   sessions: {
@@ -1689,8 +1692,10 @@ interface ActiveAcpTurn {
   promptUsage: EffectAcpSchema.Usage | undefined;
   backgroundFinalizeGeneration: number;
   readonly releasedOutlivingToolIds: Set<string>;
-  backgroundReplyFinished: ((reply: string) => Effect.Effect<boolean>) | undefined;
+  backgroundReplyFinished: ((reply: string) => Effect.Effect<AcpBackgroundReplyState>) | undefined;
   backgroundReplyTextSeen: boolean;
+  backgroundReplySawRunning: boolean;
+  backgroundReplyProgressAt: number;
   /** `replyEndsWithUsageUpdate`: output arrived and its closing `usage_update` has not. */
   replyOpen: boolean;
   /** The agent's own id for this turn's prompt, from `forkFromTurn.nativeTurnId`. */
@@ -2573,7 +2578,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         } | null>(null);
         const backgroundReplyWatch = yield* Ref.make<{
           readonly sessionId: string;
-          readonly check: (reply: string) => Effect.Effect<boolean>;
+          readonly check: (reply: string) => Effect.Effect<AcpBackgroundReplyState>;
         } | null>(null);
         const handledBackgroundTaskIdsInActiveTurn = yield* Ref.make<ReadonlySet<string>>(
           new Set(),
@@ -5619,7 +5624,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           if (context !== null) yield* settleIdleWork(context);
                           if (context !== null && flavor.wakeOnDetachedRequest) {
                             // The agent goes on with its reply once the request is answered.
-                            if (flavor.replyEndsWithUsageUpdate === true) context.replyOpen = true;
+                            if (flavor.replyEndsWithUsageUpdate === true) {
+                              context.replyOpen = true;
+                              context.backgroundReplyProgressAt = yield* Clock.currentTimeMillis;
+                            }
                             yield* rearmDeferredFinalize(context);
                           }
                         }),
@@ -5653,10 +5661,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             } else if (context.nativeThreadId === notification.sessionId) {
               if (update.sessionUpdate === "usage_update") {
                 context.replyOpen = false;
+                context.backgroundReplySawRunning = false;
                 if (context.promptSettled) yield* idleReportedSubagents(context);
                 yield* rearmDeferredFinalize(context);
               } else if (acpRootSessionUpdateIngestsOutput(notification)) {
                 context.replyOpen = true;
+                context.backgroundReplyProgressAt = yield* Clock.currentTimeMillis;
                 if (
                   (context.promptSettled || context.input.message.createdBy === "agent") &&
                   update.sessionUpdate === "agent_message_chunk"
@@ -6281,6 +6291,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       check: context.backgroundReplyFinished,
                     });
                     context.backgroundReplyTextSeen = false;
+                    context.backgroundReplySawRunning = false;
                   }
                 } else if (event._tag === "PlanUpdated") {
                   yield* emitPlan(context, event.payload, update.sessionUpdate !== "plan");
@@ -8681,9 +8692,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           });
           const rootSessionId = yield* Ref.get(activeSessionId);
           const childTurnsContinue =
-            settledStatus === "failed" &&
+            (settledStatus === "failed" || settledStatus === "interrupted") &&
             (options?.childTurnsContinue === true ||
-              (followsAgentWorkState &&
+              (settledStatus === "failed" &&
+                followsAgentWorkState &&
                 rootSessionId !== null &&
                 hasWorkingDescendant(rootSessionId)));
           yield* emitProviderEvent(
@@ -8717,6 +8729,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   runOrdinal: context.input.runOrdinal,
                   status: settledStatus,
                   failure: null,
+                  ...(childTurnsContinue ? { childTurnsContinue: true } : {}),
                   threadDisposition,
                 },
           );
@@ -8765,8 +8778,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           context.backgroundFinalizeGeneration += 1;
           const generation = context.backgroundFinalizeGeneration;
           const debounce =
-            context.replyOpen &&
-            !(context.backgroundReplyTextSeen && context.backgroundReplyFinished !== undefined)
+            context.replyOpen && context.backgroundReplyFinished === undefined
               ? ACP_OPEN_REPLY_QUIET_LIMIT
               : ACP_DEFERRED_FINALIZE_DEBOUNCE;
           yield* Effect.gen(function* () {
@@ -8779,14 +8791,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               return;
             }
             if (hasDeferredBackgroundWork(context)) return;
-            if (
-              context.replyOpen &&
-              context.backgroundReplyFinished !== undefined &&
-              context.backgroundReplyTextSeen
-            ) {
-              const finished = yield* context.backgroundReplyFinished(
+            if (context.replyOpen && context.backgroundReplyFinished !== undefined) {
+              const state = yield* context.backgroundReplyFinished(
                 context.assistant.current?.text ?? "",
               );
+              const now = yield* Clock.currentTimeMillis;
+              yield* options.testHooks?.onBackgroundReplyChecked?.(state) ?? Effect.void;
               if (
                 context.finalized ||
                 context.interrupted ||
@@ -8794,9 +8804,15 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 hasDeferredBackgroundWork(context)
               )
                 return;
-              if (!finished) {
-                // A streamed reply can pause between chunks. Only native completion closes it.
-                context.backgroundReplyTextSeen = false;
+              if (state === "running") context.backgroundReplySawRunning = true;
+              if (
+                state === "running" ||
+                (state === "unknown" &&
+                  (context.backgroundReplySawRunning ||
+                    now - context.backgroundReplyProgressAt <
+                      Duration.toMillis(ACP_OPEN_REPLY_QUIET_LIMIT)))
+              ) {
+                // Keep checking: a native reply can finish without another ACP chunk.
                 yield* scheduleDeferredFinalize(context);
                 return;
               }
@@ -9176,6 +9192,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                         check: context.backgroundReplyFinished,
                       });
                       context.backgroundReplyTextSeen = false;
+                      context.backgroundReplySawRunning = false;
                     }
                     context.promptSettled = true;
                     context.promptSettledStatus = status;
@@ -9449,6 +9466,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   ? previousReplyWatch.check
                   : undefined,
               backgroundReplyTextSeen: false,
+              backgroundReplySawRunning: false,
+              backgroundReplyProgressAt: yield* Clock.currentTimeMillis,
               replyOpen: false,
               nativePromptId: undefined,
               lastProgressAt: 0,
