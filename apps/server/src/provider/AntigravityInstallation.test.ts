@@ -13,6 +13,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Sink from "effect/Sink";
@@ -97,11 +98,13 @@ interface HarnessOptions {
   readonly platform?: NodeJS.Platform;
   readonly arch?: NodeJS.Architecture;
   readonly path?: string;
+  readonly environment?: NodeJS.ProcessEnv;
   readonly previous?: boolean;
   readonly fileSystem?: FileSystem.FileSystem;
   readonly spawner?: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly validate?: AntigravityInstallation.AntigravityInstallationOptions["validate"];
   readonly useDefaultValidation?: boolean;
+  readonly useDefaultExternalValidation?: boolean;
   readonly connectTimeout?: boolean;
   readonly manifest?: Effect.Effect<ModelManifest.ModelManifestData>;
   readonly native?: boolean;
@@ -177,6 +180,9 @@ const makeHarness = Effect.fn("test.makeAntigravityInstallation")(function* (
               Effect.andThen(options.validate?.(executable, version) ?? Effect.void),
             ),
         }),
+    ...(options.useDefaultExternalValidation
+      ? {}
+      : { validateExternal: () => Effect.succeed("1.5.12") }),
   }).pipe(
     options.spawner
       ? Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, options.spawner)
@@ -184,7 +190,10 @@ const makeHarness = Effect.fn("test.makeAntigravityInstallation")(function* (
     Effect.provideService(FileSystem.FileSystem, trackedFs),
     Effect.provideService(HostProcess.Platform, platform),
     Effect.provideService(HostProcess.Architecture, arch),
-    Effect.provideService(HostProcess.Environment, { PATH: options.path ?? "" }),
+    Effect.provideService(HostProcess.Environment, {
+      ...options.environment,
+      PATH: options.path ?? "",
+    }),
     Effect.provideService(ModelManifest.ModelManifest, {
       current: options.manifest ?? Effect.succeed(ModelManifest.BUNDLED_MODEL_MANIFEST),
       refresh: Effect.succeed(ModelManifest.BUNDLED_MODEL_MANIFEST),
@@ -262,6 +271,114 @@ const expectPreviousRelease = Effect.fn("test.expectPreviousAntigravityRelease")
   expect(yield* fs.readFileString(resolved.executablePath)).toBe(serverContents);
   expect((yield* installation.state).installedVersion).toBe(previousVersion);
 });
+
+it.live("verifies a custom launcher by ACP identity and caches the result", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const actualSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const node = yield* HostProcess.ExecutablePath;
+    const env = yield* HostProcess.Environment;
+    const baseDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-custom-agy-" });
+    const good = path.join(baseDir, hostPlatform === "win32" ? "launcher.exe" : "launcher");
+    const bad = path.join(baseDir, hostPlatform === "win32" ? "other.exe" : "other");
+    const broken = path.join(baseDir, hostPlatform === "win32" ? "broken.exe" : "broken");
+    yield* fs.writeFileString(good, "fixture", { mode: 0o755 });
+    yield* fs.writeFileString(bad, "fixture", { mode: 0o755 });
+    yield* fs.writeFileString(broken, "fixture", { mode: 0o755 });
+    const commands: Array<{
+      command: string;
+      args: ReadonlyArray<string>;
+      env: NodeJS.ProcessEnv;
+    }> = [];
+    let reportedVersion = "1.5.12";
+    let withdrawn = false;
+    const manifest = Effect.sync(() =>
+      withdrawn
+        ? ({
+            ...ModelManifest.BUNDLED_MODEL_MANIFEST,
+            compatibility: [
+              {
+                driver: "antigravity",
+                t3CodeRange: ">=0.0.42",
+                ranges: [{ range: "=1.5.12", status: "broken" }],
+              },
+            ],
+          } satisfies ModelManifest.ModelManifestData)
+        : ModelManifest.BUNDLED_MODEL_MANIFEST,
+    );
+    const spawner = ChildProcessSpawner.make((command) => {
+      if (
+        !ChildProcess.isStandardCommand(command) ||
+        ![good, bad, broken].includes(command.command)
+      ) {
+        return actualSpawner.spawn(command);
+      }
+      commands.push({
+        command: command.command,
+        args: command.args.map((arg) => (Redacted.isRedacted(arg) ? Redacted.value(arg) : arg)),
+        env: Object.fromEntries(
+          Object.entries(command.options.env ?? {}).map(([key, value]) => [
+            key,
+            Redacted.isRedacted(value) ? Redacted.value(value) : value,
+          ]),
+        ),
+      });
+      const name = command.command === good ? "Antigravity ACP Server" : "Other ACP Server";
+      const script =
+        command.command === broken
+          ? "process.stderr.write('fixture-secret'); process.exit(1);"
+          : `require('readline').createInterface({input:process.stdin}).on('line', line => { const request=JSON.parse(line); if(request.method==='initialize') process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:1,agentInfo:{name:${JSON.stringify(name)},version:${JSON.stringify(reportedVersion)}},agentCapabilities:{},authMethods:[]}})+'\\n'); });`;
+      return actualSpawner.spawn(ChildProcess.make(node, ["-e", script], command.options));
+    });
+    const { installation } = yield* makeHarness({
+      baseDir,
+      spawner,
+      manifest,
+      environment: { ...env, GEMINI_API_KEY: "fixture-secret", CUSTOM_PROBE: "fixture-env" },
+      path: env.PATH ?? "",
+      useDefaultExternalValidation: true,
+    });
+    expect(yield* installation.resolve(good)).toMatchObject({
+      executablePath: good,
+      source: "override",
+      version: "1.5.12",
+    });
+    yield* installation.resolve(good);
+    expect(commands.filter((command) => command.command === good)).toHaveLength(1);
+    expect(commands[0]?.args).toEqual([
+      "acp",
+      "--gemini-dir",
+      expect.any(String),
+      "--app-data-dir",
+      "antigravity-acp",
+    ]);
+    expect(commands[0]?.env.CUSTOM_PROBE).toBe("fixture-env");
+    expect(commands[0]?.env.GEMINI_API_KEY).toBeUndefined();
+    yield* fs.writeFileString(good, "changed fixture", { mode: 0o755 });
+    yield* installation.resolve(good);
+    expect(commands.filter((command) => command.command === good)).toHaveLength(2);
+    yield* installation.resolve(good, { ...env, CUSTOM_PROBE: "changed-env" });
+    expect(commands.filter((command) => command.command === good)).toHaveLength(3);
+    yield* installation.resolve(good);
+    yield* installation.resolve(good, { ...env, CUSTOM_PROBE: "changed-env" });
+    expect(commands.filter((command) => command.command === good)).toHaveLength(3);
+    reportedVersion = "1.5.13";
+    withdrawn = true;
+    expect((yield* installation.resolve(good)).version).toBe("1.5.13");
+    expect(commands.filter((command) => command.command === good)).toHaveLength(4);
+    const error = yield* installation.resolve(bad).pipe(Effect.flip);
+    expect(error.detail).toMatch(/custom Antigravity.*agy CLI/i);
+    const brokenError = yield* installation.resolve(broken).pipe(Effect.flip);
+    expect(brokenError.detail).toMatch(/custom Antigravity.*agy CLI/i);
+    expect(JSON.stringify(brokenError)).not.toContain("fixture-secret");
+    expect(
+      yield* installation.resolve(path.join(baseDir, "missing.exe")).pipe(Effect.flip),
+    ).toMatchObject({
+      operation: "resolve",
+    });
+  }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
 
 it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity installation", (it) => {
   it.effect.each([...new Set(["win32", hostPlatform])] as NodeJS.Platform[])(
@@ -959,7 +1076,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
 
   // The mocked Linux PATH walk needs POSIX paths; Windows temp paths contain colons.
   it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
-    "accepts only the agy CLI as a custom or PATH executable",
+    "resolves custom launchers and discovers agy on PATH",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -983,7 +1100,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
         expect(yield* installation.resolve(cli)).toMatchObject({
           executablePath: cli,
           source: "override",
-          version: null,
+          version: "1.5.12",
         });
         expect(yield* installation.resolve(alias)).toMatchObject({
           executablePath: alias,
@@ -995,8 +1112,9 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("Antigravity inst
           executablePath: alias,
           source: "path",
         });
-        expect(yield* installation.resolve(other).pipe(Effect.flip)).toMatchObject({
-          operation: "resolve",
+        expect(yield* installation.resolve(other)).toMatchObject({
+          executablePath: other,
+          source: "override",
         });
 
         // Version-manager shims dispatch by their invoked name, so the shim path is what runs.

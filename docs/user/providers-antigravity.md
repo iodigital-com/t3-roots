@@ -51,7 +51,8 @@ space for downloading and staging an update.
 ### Use a manual installation
 
 Install [Antigravity CLI](https://antigravity.google/docs/getting-started) on the environment.
-Set **Binary path** to its `agy` executable and update it yourself.
+Set **Binary path** to its `agy` executable or a compatible launcher and update it yourself.
+T3 checks the launcher's Antigravity protocol response before using it.
 Leave the field blank to use the managed runtime, or a compatible executable on
 `PATH` if no managed runtime is installed.
 
