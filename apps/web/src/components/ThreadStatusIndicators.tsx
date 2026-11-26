@@ -414,7 +414,7 @@ export function ThreadPullRequestBadgeControl({
   url?: string | undefined;
   status: PrStatusIndicator | null;
   onOpenList: () => void;
-  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string) => void;
+  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string, fromList?: boolean) => void;
 }) {
   const m = useMessages();
   const presentation = resolveThreadPullRequestBadgePresentation({ badge, number, url, status }, m);
@@ -491,7 +491,7 @@ function PullRequestBadge({
   status: PrStatusIndicator | null;
   pullRequests: ReadonlyArray<ThreadPullRequestLink>;
   onOpenList: () => void;
-  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string) => void;
+  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string, fromList?: boolean) => void;
 }) {
   const onClick = opensList
     ? (event: MouseEvent<HTMLElement>) => {
@@ -534,7 +534,7 @@ function PullRequestBadge({
           {visibleThreadPullRequests(pullRequests).length > 0 ? (
             <ThreadPullRequestsMiniList
               pullRequests={pullRequests}
-              onOpenPullRequest={onOpenPullRequest}
+              onOpenPullRequest={(event, url) => onOpenPullRequest(event, url, true)}
             />
           ) : number !== undefined && url !== undefined ? (
             <ul className="flex flex-col gap-1">
@@ -543,7 +543,7 @@ function PullRequestBadge({
                 url={url}
                 title={status?.tooltipTitle ?? presentation.label}
                 presentation={presentation}
-                onOpenPullRequest={onOpenPullRequest}
+                onOpenPullRequest={(event, url) => onOpenPullRequest(event, url, true)}
               />
             </ul>
           ) : null}
