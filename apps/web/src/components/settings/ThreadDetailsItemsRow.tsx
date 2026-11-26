@@ -22,9 +22,7 @@ export function ThreadDetailsItemsRow() {
   return (
     <SettingsRow
       {...searchableSetting("thread-details-items")}
-      description={gt(
-        "Choose what the thread details card shows. You can also right-click the card.",
-      )}
+      description={gt("Choose what the thread shows. You can also right-click the details card.")}
       resetAction={
         isDefaultThreadDetailsVisibility(visibility) ? null : (
           <SettingResetButton
