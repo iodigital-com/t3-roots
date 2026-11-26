@@ -1034,10 +1034,10 @@ export const make = Effect.gen(function* () {
   const reconcileCheckedOutRef = Effect.fn("VcsStatusBroadcaster.reconcileCheckedOutRef")(
     function* (cwd: string) {
       if (!detailedSubscribers.has(cwd)) return;
-      if ((yield* getCachedStatus(cwd))?.remote) {
+      const hadRemote = (yield* getCachedStatus(cwd))?.remote != null;
+      yield* refreshLocalStatusCore(cwd);
+      if (hadRemote || (yield* SynchronizedRef.get(pollersRef)).has(cwd)) {
         yield* refreshRemoteStatus(cwd, { refreshUpstream: false });
-      } else {
-        yield* refreshLocalStatusCore(cwd);
       }
     },
   );

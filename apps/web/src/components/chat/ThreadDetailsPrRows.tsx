@@ -109,12 +109,17 @@ function ThreadDetailsPrRows({
             },
           });
   const currentRow = <ThreadDetailsPrRow {...row} onStopWatching={stopWatching(currentLink)} />;
-  const rest =
-    currentLink === null
-      ? []
-      : pipe(visibleThreadPullRequests(links), resolveThreadPullRequestChains, pullRequestListLines)
-          .map((line) => line.link)
-          .filter((link) => threadPullRequestKeyOf(link) !== threadPullRequestKeyOf(currentLink));
+  const rest = pipe(
+    visibleThreadPullRequests(links),
+    resolveThreadPullRequestChains,
+    pullRequestListLines,
+  )
+    .map((line) => line.link)
+    .filter(
+      (link) =>
+        currentLink === null ||
+        threadPullRequestKeyOf(link) !== threadPullRequestKeyOf(currentLink),
+    );
   if (rest.length === 0) return currentRow;
 
   return (

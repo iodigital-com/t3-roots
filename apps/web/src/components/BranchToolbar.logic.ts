@@ -288,10 +288,10 @@ export function resolveBranchTriggerLabel(
 }
 
 export function resolveBranchToolbarPrBranch(input: {
-  activeThreadBranch: string | null;
+  currentGitBranch: string | null;
   resolvedActiveBranch: string | null;
 }): string | null {
-  return input.activeThreadBranch === input.resolvedActiveBranch ? input.activeThreadBranch : null;
+  return input.currentGitBranch === input.resolvedActiveBranch ? input.currentGitBranch : null;
 }
 
 export function resolveLocalCheckoutBranchMismatch(input: {

@@ -12,6 +12,7 @@ import {
   resolveThreadPullRequestChains,
   resolveThreadPullRequestBadge,
   threadPullRequestKeysEqual,
+  resolveThreadCurrentPullRequestLinkForBranch,
 } from "./threadPullRequests.ts";
 
 // Remove ES2023 array methods to match Hermes on mobile.
@@ -104,6 +105,33 @@ describe("threadPullRequestKeysEqual", () => {
 });
 
 describe("resolveThreadCurrentPullRequest", () => {
+  it("prefers the current branch request by repository and number while keeping linked requests", () => {
+    const otherRepo = link(2, {
+      repository: "other/repo",
+      url: "https://github.com/other/repo/pull/2",
+      snapshot: snapshot({ headBranch: "feature/next" }),
+    });
+    const current = link(2, { snapshot: snapshot({ headBranch: "feature/next" }) });
+    const links = [link(1), current, otherRepo];
+    expect(resolveThreadCurrentPullRequestLinkForBranch(links, current.url)).toBe(current);
+    expect(
+      resolveThreadCurrentPullRequestLinkForBranch(
+        links,
+        "https://gitlab.com/group/repo/-/merge_requests/2",
+      ),
+    ).toBeNull();
+    expect(resolveThreadCurrentPullRequestLinkForBranch(links, null)).not.toBeNull();
+    expect(resolveThreadCurrentPullRequestLinkForBranch([], null)).toBeNull();
+    const gitlab = link(2, {
+      host: "gitlab.com",
+      repository: "group/repo",
+      url: "https://gitlab.com/group/repo/-/merge_requests/2",
+    });
+    expect(resolveThreadCurrentPullRequestLinkForBranch([...links, gitlab], gitlab.url)).toBe(
+      gitlab,
+    );
+    expect(links).toHaveLength(3);
+  });
   it("selects the same terminal link as stable sorting across input orders", () => {
     const dates = ["invalid", "1969-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z"];
     for (let offset = 0; offset < dates.length; offset++) {

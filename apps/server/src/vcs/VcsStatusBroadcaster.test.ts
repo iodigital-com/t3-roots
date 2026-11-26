@@ -1811,6 +1811,7 @@ describe("VcsStatusBroadcaster", () => {
         localInvalidationCalls: 0,
         remoteInvalidationCalls: 0,
         remoteStatusRefreshUpstreamValues: [] as Array<boolean | undefined>,
+        beforeRemoteStatus: Effect.void,
         headPath,
       };
 
@@ -1834,19 +1835,108 @@ describe("VcsStatusBroadcaster", () => {
         yield* Deferred.await(subscribed);
 
         // What `git switch -c repro` does to HEAD, with the test clock never advanced.
+        const remoteStarted = yield* Deferred.make<void>();
+        const releaseRemote = yield* Deferred.make<void>();
+        state.beforeRemoteStatus = Deferred.succeed(remoteStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseRemote)),
+        );
         state.currentLocalStatus = { ...baseLocalStatus, isDefaultRef: false, refName: "repro" };
         state.currentRemoteStatus = { ...baseRemoteStatus, hasUpstream: false };
         const lockPath = path.join(gitDir, "HEAD.lock");
         yield* fs.writeFileString(lockPath, "ref: refs/heads/repro\n");
         yield* fs.rename(lockPath, headPath);
+        yield* Deferred.await(remoteStarted);
+        const beforeRemote = clientStates.at(-1);
+        yield* Deferred.succeed(releaseRemote, undefined);
         yield* Deferred.await(checkedOut);
 
+        assert.equal(beforeRemote?.refName, "repro");
+        assert.isNull(beforeRemote?.pr);
         assert.deepStrictEqual(
           clientStates.filter((status) => status.refName === "repro").map((status) => status.pr),
           [null, null],
         );
         // A checkout must not trigger a network fetch.
         assert.deepStrictEqual(state.remoteStatusRefreshUpstreamValues.slice(1), [false]);
+      }).pipe(Effect.provide(layerTestFor(state)), Effect.scoped);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("rapid checkouts discard a late request and refresh the latest branch", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const gitDir = yield* fs.makeTempDirectoryScoped({ prefix: "vcs-head-watch-" });
+      const headPath = path.join(gitDir, "HEAD");
+      yield* fs.writeFileString(headPath, "ref: refs/heads/main\n");
+      const state = {
+        currentLocalStatus: { ...baseLocalStatus, refName: "main" },
+        currentRemoteStatus: remoteStatusWithPr as VcsStatusRemoteResult | null,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+        beforeRemoteStatus: Effect.void,
+        headPath,
+      };
+
+      yield* Effect.gen(function* () {
+        const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+        yield* broadcaster.getStatus({ cwd: "/repo" });
+        const branches = yield* Stream.toPull(broadcaster.streamBranchStatus({ cwd: "/repo" }));
+        yield* branches;
+        const states: Array<VcsStatusResult> = [];
+        const subscribed = yield* Deferred.make<void>();
+        const latest = yield* Deferred.make<void>();
+        yield* Stream.runForEach(broadcaster.streamStatus({ cwd: "/repo" }), (event) =>
+          Effect.gen(function* () {
+            const next = applyGitStatusStreamEvent(states.at(-1) ?? null, event);
+            states.push(next);
+            yield* Deferred.succeed(subscribed, undefined);
+            if (
+              event._tag === "remoteUpdated" &&
+              next.refName === "third" &&
+              next.pr?.number === 3003
+            ) {
+              yield* Deferred.succeed(latest, undefined);
+            }
+          }),
+        ).pipe(Effect.forkScoped);
+        yield* Deferred.await(subscribed);
+
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        state.beforeRemoteStatus = Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+        );
+        const checkout = (refName: string) =>
+          Effect.gen(function* () {
+            state.currentLocalStatus = { ...baseLocalStatus, refName };
+            const lockPath = path.join(gitDir, "HEAD.lock");
+            yield* fs.writeFileString(lockPath, `ref: refs/heads/${refName}\n`);
+            yield* fs.rename(lockPath, headPath);
+          });
+        state.currentRemoteStatus = {
+          ...baseRemoteStatus,
+          pr: { ...remoteStatusWithPr.pr!, number: 3002, headRef: "second" },
+        };
+        yield* checkout("second");
+        assert.deepEqual(yield* branches, [{ refName: "second", isRepo: true }]);
+        yield* Deferred.await(started);
+        state.currentRemoteStatus = {
+          ...baseRemoteStatus,
+          pr: { ...remoteStatusWithPr.pr!, number: 3003, headRef: "third" },
+        };
+        yield* checkout("third");
+        assert.deepEqual(yield* branches, [{ refName: "third", isRepo: true }]);
+        state.beforeRemoteStatus = Effect.void;
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(latest);
+
+        assert.isFalse(
+          states.some((value) => value.refName === "third" && value.pr?.number === 3002),
+        );
+        assert.equal(states.at(-1)?.pr?.number, 3003);
       }).pipe(Effect.provide(layerTestFor(state)), Effect.scoped);
     }).pipe(Effect.provide(NodeServices.layer)),
   );

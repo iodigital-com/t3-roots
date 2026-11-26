@@ -26,6 +26,7 @@ import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { useProject } from "../state/entities";
 import {
   pullRequestListLines,
+  resolveThreadCurrentPullRequestLinkForBranch,
   resolveThreadCurrentPullRequestLink,
   resolveThreadPullRequestBadge,
   resolveThreadPullRequestChains,
@@ -120,7 +121,7 @@ export function useLinkedThreadPullRequest(
       };
 }
 
-/** The pull request a thread shows: its current link, else the one found for its branch. */
+/** Prefer the checked-out branch's request while retaining explicitly linked requests. */
 export function useThreadDisplayedPullRequest(
   environmentId: EnvironmentId,
   thread: Pick<
@@ -137,23 +138,25 @@ export function useThreadDisplayedPullRequest(
     thread?.linkedPullRequest,
     true,
     thread?.pullRequests,
-    thread?.branchPullRequest,
   );
   const currentLink = supportsLinks
-    ? resolveThreadCurrentPullRequestLink(thread?.pullRequests ?? [])
+    ? resolveThreadCurrentPullRequestLinkForBranch(
+        thread?.pullRequests ?? [],
+        branchPr?.url ?? null,
+      )
     : null;
-  const pr = linkedStatus?.pr ?? (currentLink === null ? branchPr : null);
+  const pr = branchPr ?? linkedStatus?.pr ?? null;
   return {
     currentLink,
     badge: supportsLinks ? resolveThreadPullRequestBadge(thread?.pullRequests) : null,
     pr,
     status: prStatusIndicator(
       pr,
-      linkedStatus?.sourceControlProvider ?? branchSourceControlProvider,
+      branchPr !== null ? branchSourceControlProvider : linkedStatus?.sourceControlProvider,
       m,
     ),
-    number: currentLink?.number ?? pr?.number,
-    url: currentLink?.url ?? pr?.url,
+    number: branchPr?.number ?? currentLink?.number ?? pr?.number,
+    url: branchPr?.url ?? currentLink?.url ?? pr?.url,
   };
 }
 
