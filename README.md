@@ -61,7 +61,7 @@ Instead of adding gateway-specific logic to T3 Code, T3-Roots adds five clean, g
 
 ### 5. Standalone Cross-Platform Releases (macOS & Windows 11)
 
-- **Automated draft release workflow (`release-roots.yml`):** Tagging `vX.Y.Z-roots.N` builds:
+- **Manual draft release workflow (`release-roots.yml`):** Dispatching a batched release for an existing `vX.Y.Z-roots.N` tag builds:
   - **macOS Apple Silicon (`arm64`)** and **macOS Intel (`x64`)** `.dmg` and `.zip` bundles (ad-hoc signed after bytecode cache generation and launch-tested in CI, with Squirrel auto-update cleanly disabled on unsigned macOS builds).
   - **Windows 11 (`x64`)** NSIS `.exe` installer (with packaged startup bytecode cache budget accounted for and embedded Linux x64 WSL runtime).
   - **`SHA256SUMS`** covering all installers and archives.

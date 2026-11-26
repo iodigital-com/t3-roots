@@ -184,6 +184,14 @@ function decide(files, packages, full) {
       test_web: has("@t3tools/web"),
       test_server: has("t3"),
       rust: everything || rust,
+      // Native Windows behavior matters for the desktop shell and 1Password bridge.
+      windows:
+        everything ||
+        files.some((file) =>
+          /^(apps\/desktop\/|packages\/secret-provider-onepassword\/|packages\/shared\/src\/HostProcess\.ts)/.test(
+            file,
+          ),
+        ),
       release_smoke: scriptsChanged,
       mobile_native: files === null || files.some((file) => MOBILE_NATIVE.test(file)),
     },

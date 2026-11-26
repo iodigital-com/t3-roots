@@ -30,6 +30,7 @@ jobs:
       test_web: ${{ steps.detect.outputs.test_web }}
       test_server: ${{ steps.detect.outputs.test_server }}
       rust: ${{ steps.detect.outputs.rust }}
+      windows: ${{ steps.detect.outputs.windows }}
     steps:
       # Only the package manifests the script reads to build the dependency graph.
       # Depth 2 brings the base commit the change is diffed against.
@@ -50,17 +51,16 @@ jobs:
         id: detect
         uses: ./.github/actions/ci-changes
 
-  # Lint and the desktop build each get a runner so they run side by side.
-  # Typecheck shares the build's install. Lint always runs: it formats every
-  # file, docs included. The `Check` job at the end of this file passes only
-  # when every other job passes or was skipped by `changes`.
-  lint:
+  # Share one install across repository checks, the desktop build and typecheck.
+  build:
     permissions:
       contents: read
       id-token: write
-    name: Lint
+    name: Lint, Build and Typecheck
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -78,60 +78,6 @@ jobs:
             printf 'PR evidence must be uploaded to GitHub, not committed:\n%s\n' "$files" >&2
             exit 1
           fi
-
-      - name: Setup Vite+
-        uses: ./.github/actions/setup-ci-deps
-        with:
-          task-cache-read-token: ${{ secrets.T3_TASK_CACHE_READ_TOKEN }}
-
-      # electron's install.js (run by ensure:electron) reads this cache before it
-      # downloads from GitHub. The key changes only with the Electron version.
-      - name: Cache Electron download
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cache/electron
-          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('node_modules/.pnpm/electron@*/node_modules/electron/package.json') }}
-
-      - name: Ensure Electron runtime is installed
-        run: vp run --filter @t3tools/desktop ensure:electron
-
-      # Files/dependencies are repo-wide; export checks cover clean workspaces only.
-      - name: Check unused code
-        run: vp run knip:check
-
-      - name: Check generated GitHub GraphQL operations
-        run: vp run --filter @t3tools/source-control-github generate --check
-
-      - name: Check generated Expo GraphQL operations
-        run: vp run --filter t3 generate --check
-
-      - name: Check generated Linear GraphQL operations
-        run: vp run --filter @t3tools/issue-tracker-linear generate --check
-
-      - name: Check i18n catalogs
-        run: vp run i18n:check
-
-      - name: Check
-        run: vp check
-
-  build:
-    permissions:
-      contents: read
-      id-token: write
-    name: Build and Typecheck
-    needs: changes
-    if: ${{ !cancelled() && (needs.changes.outputs.build != 'false' || needs.changes.outputs.typecheck != 'false') }}
-    runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          sparse-checkout: |
-            /*
-            !/.repos/
-            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
-          sparse-checkout-cone-mode: false
 
       - uses: ./.github/actions/setup-apt-mirrors
         if: needs.changes.outputs.build != 'false'
@@ -170,6 +116,25 @@ jobs:
       - name: Ensure Electron runtime is installed
         id: electron
         run: vp run --filter @t3tools/desktop ensure:electron
+
+      # Files/dependencies are repo-wide; export checks cover clean workspaces only.
+      - name: Check unused code
+        run: vp run knip:check
+
+      - name: Check generated GitHub GraphQL operations
+        run: vp run --filter @t3tools/source-control-github generate --check
+
+      - name: Check generated Expo GraphQL operations
+        run: vp run --filter t3 generate --check
+
+      - name: Check generated Linear GraphQL operations
+        run: vp run --filter @t3tools/issue-tracker-linear generate --check
+
+      - name: Check i18n catalogs
+        run: vp run i18n:check
+
+      - name: Check
+        run: vp check
 
       # Runs in the background while the build runs, and reports in the last
       # step: neither result hides the other.
@@ -327,7 +292,7 @@ jobs:
         run: python3 -B .github/scripts/stage-preview-bundle.test.py
 
       - name: Test release checks
-        run: node --test .github/scripts/check-nightly-release.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs
+        run: node --test .github/scripts/ci-gate.test.cjs .github/scripts/check-nightly-release.test.cjs .github/scripts/mobile-preview-comment.test.cjs .github/scripts/mobile-ios-preview-record.test.cjs .github/scripts/test-delta.test.cjs
 
       - name: Finish installing browser secret helper build libraries
         timeout-minutes: 5
@@ -356,9 +321,7 @@ jobs:
 
   # The web suite is the largest outside the server. In the shared Test job it
   # started last and ran alone for about 40s after everything else finished.
-  # Browser tests are bound by the Vite server transforming modules for each
-  # file, not by Chromium, so a second runner (and Vite server) halves the job
-  # that gated every run. release.yml mirrors this test, test_web, and test_server split.
+  # Two shards retain the complete suite while reducing runner setup costs.
   test_web:
     permissions:
       contents: read
@@ -367,11 +330,11 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_web != 'false' }}
     runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ github.repository == 'pingdotgg/t3code' && fromJSON('[1, 2]') || fromJSON('[1, 2, 3, 4]') }}
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -425,7 +388,7 @@ jobs:
   # one at a time. Sharding spreads them over separate runners instead of
   # separate workers, so no two server test files ever share a machine and the
   # isolation that flag buys is preserved exactly. One file at a time keeps
-  # about 1.5 cores busy, so 4 vCPU runners lose nothing against 8. The shards
+  # about 1.5 cores busy. The shards
   # split files by recorded duration (apps/server/src/testUtils/weightedShardSequencer.ts).
   test_server:
     permissions:
@@ -435,11 +398,11 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.test_server != 'false' }}
     runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -532,7 +495,27 @@ jobs:
             cargo test --locked --manifest-path "native/$crate/Cargo.toml"
           done
 
-  # Branch protection requires this job by its name, `Check`. It fails when any
+  # Exercise the Windows 1Password bridge and update policy only when their
+  # desktop or secret-provider inputs change. Packaging remains release-only.
+  windows:
+    name: Test Windows
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.windows != 'false' }}
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+            !/apps/mobile/modules/t3-terminal/Vendor/**/*.a
+          sparse-checkout-cone-mode: false
+      - uses: ./.github/actions/setup-ci-deps
+      - name: Test Windows bridge and desktop updates
+        run: vp test run packages/secret-provider-onepassword/src/server/driver.test.ts apps/desktop/src/updates/DesktopUpdates.test.ts
+
+  # `Check` provides a stable gate if branch protection requires it. It fails when any
   # other job fails, is cancelled, or is skipped without a reason, so splitting
   # or resharding jobs needs no ruleset change. Add every new job to `needs`.
   # `always()` rather than `!cancelled()`: a skipped job reports success to
@@ -540,7 +523,7 @@ jobs:
   check:
     name: Check
     if: ${{ always() }}
-    needs: [changes, lint, build, test, test_web, test_server, rust]
+    needs: [changes, build, test, test_web, test_server, rust, windows]
     runs-on: ${{ github.repository == 'pingdotgg/t3code' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
@@ -550,10 +533,11 @@ jobs:
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           # A job may skip only when `changes` said every gate it represents was
-          # not needed. Gates are keyed by job name, except merged Build.
+          # not needed. Build always runs repository-wide lint.
           echo "$RESULTS" | jq -e '.changes.outputs as $gates
-            | {build: ["build", "typecheck", "desktop_launch"]} as $renamed
-            | all(to_entries[];
+            | (keys == (["changes", "build", "test", "test_web", "test_server", "rust", "windows"] | sort))
+            and all(to_entries[];
                 .value.result == "success"
                 or (.value.result == "skipped"
-                  and (($renamed[.key] // [.key]) | all(.[]; $gates[.] == "false"))))' > /dev/null
+                  and (.key != "changes" and .key != "build")
+                  and $gates[.key] == "false"))' > /dev/null
