@@ -50,6 +50,7 @@ describe("buildThreadActionMenuItems", () => {
         : [
             "pin",
             "settle",
+            "settle-bridge",
             "snooze",
             "rename",
             "regenerate-title",

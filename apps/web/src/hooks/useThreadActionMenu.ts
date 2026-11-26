@@ -26,6 +26,7 @@ import {
 import { titleRegenerationToast } from "../components/threadTitleRegenerationToast";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { copyThreadReference } from "../lib/copyThreadReference";
+import { bridgeIssueForAction, bridgeWorklogUrl } from "../lib/bridgeWorklog";
 import { m } from "../i18n/messages";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { threadEnvironment } from "../state/threads";
@@ -145,6 +146,7 @@ export function useThreadActionMenu(input: {
         projectFilter: null,
         isPinned: thread.pinnedAt != null,
         isSettled: supports.settlement && thread.settledOverride === "settled",
+        issues: thread.issues,
         autoSettleEnabled: thread.autoSettleDisabledAt == null,
         isSnoozed: supports.snooze && effectiveSnoozed(thread, { now: now.toISOString() }),
         canSnoozeNow: canSnooze(thread, { now: now.toISOString() }),
@@ -182,6 +184,23 @@ export function useThreadActionMenu(input: {
         const result = await snoozeThread(threadRef, preset.snoozedUntil);
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           failureToast(m(msg("Failed to snooze thread")), squashAtomCommandFailure(result));
+        }
+        return;
+      }
+      if (action === "settle-bridge" || action.startsWith("settle-bridge:")) {
+        const issue = bridgeIssueForAction(thread.issues, action);
+        if (issue === undefined) return;
+        try {
+          await api.shell.openExternal(
+            bridgeWorklogUrl({ issue, title: thread.title, now: new Date() }),
+          );
+        } catch (error) {
+          failureToast(m(msg("Unable to open link.")), error);
+          return;
+        }
+        const result = await settleThread(threadRef);
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          failureToast(m(msg("Failed to settle thread")), squashAtomCommandFailure(result));
         }
         return;
       }

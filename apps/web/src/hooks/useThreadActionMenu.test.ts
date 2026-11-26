@@ -27,6 +27,9 @@ const state = vi.hoisted(() => ({
       position: { x: number; y: number },
     ) => Promise<ThreadActionMenuId | null>
   >(),
+  openExternal: vi.fn(async (_url: string) => {
+    state.effects.push("open");
+  }),
 }));
 
 function recordEffect(action: string) {
@@ -72,6 +75,7 @@ vi.mock("../state/use-atom-command", () => ({
 vi.mock("../localApi", () => ({
   readLocalApi: () => ({
     contextMenu: { show: state.show, close: () => {} },
+    shell: { openExternal: state.openExternal },
     dialogs: {
       confirm: async () => {
         recordEffect("confirm");
@@ -163,22 +167,28 @@ beforeEach(() => {
   state.effects = [];
   state.completed = deferred<void>();
   state.show.mockReset().mockResolvedValue(null);
+  state.openExternal.mockClear();
 });
 
 describe("thread menu permissions", () => {
-  it.each(["rename", "regenerate-title", "delete", "pin", "settle", "archive"] as const)(
-    "%s rechecks after the native menu closes",
-    async (action) => {
-      state.granted.add("secondary");
-      const choice = deferred<ThreadActionMenuId | null>();
-      state.show.mockReturnValue(choice.promise);
-      createMenu().openMenu(position);
-      state.granted.delete("secondary");
-      choice.resolve(action);
-      await state.completed.promise;
-      expect(state.effects).toEqual([]);
-    },
-  );
+  it.each([
+    "rename",
+    "regenerate-title",
+    "delete",
+    "pin",
+    "settle",
+    "settle-bridge",
+    "archive",
+  ] as const)("%s rechecks after the native menu closes", async (action) => {
+    state.granted.add("secondary");
+    const choice = deferred<ThreadActionMenuId | null>();
+    state.show.mockReturnValue(choice.promise);
+    createMenu().openMenu(position);
+    state.granted.delete("secondary");
+    choice.resolve(action);
+    await state.completed.promise;
+    expect(state.effects).toEqual([]);
+  });
 
   it("offers find only to a header that can open it, without task permission", async () => {
     createMenu().openMenu(position);
@@ -192,5 +202,27 @@ describe("thread menu permissions", () => {
     expect(items[0]?.disabled).not.toBe(true);
     expect(state.effects).toEqual(["find"]);
     expect(onFind).toHaveBeenCalledExactlyOnceWith(target);
+  });
+});
+
+describe("settle and book hours", () => {
+  it("opens the editable form before settling, and leaves time blank", async () => {
+    state.granted.add("secondary");
+    state.show.mockResolvedValue("settle-bridge");
+    createMenu().openMenu(position);
+    await state.completed.promise;
+    expect(state.effects).toEqual(["open", "settleThread"]);
+    const url = new URL(state.openExternal.mock.calls[0]![0]);
+    expect(url.searchParams.get("description")).toBe("Thread");
+    expect(url.searchParams.has("minutesSpent")).toBe(false);
+  });
+
+  it("does not settle if opening Bridge fails", async () => {
+    state.granted.add("secondary");
+    state.show.mockResolvedValue("settle-bridge");
+    state.openExternal.mockRejectedValueOnce(new Error("unavailable"));
+    createMenu().openMenu(position);
+    await state.completed.promise;
+    expect(state.effects).toEqual([]);
   });
 });

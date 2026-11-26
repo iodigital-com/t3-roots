@@ -241,6 +241,7 @@ import {
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { titleRegenerationToast } from "./threadTitleRegenerationToast";
 import { copyThreadReference } from "../lib/copyThreadReference";
+import { bridgeIssueForAction, bridgeWorklogUrl } from "../lib/bridgeWorklog";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { Button } from "./ui/button";
 import { isProjectPinShortcut, ProjectPinButton } from "./ProjectPinButton";
@@ -2675,6 +2676,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   : null,
               isPinned,
               isSettled,
+              issues: thread.issues,
               autoSettleEnabled: thread.autoSettleDisabledAt == null,
               isSnoozed,
               canSnoozeNow: canSnooze(thread, { now: new Date().toISOString() }),
@@ -2711,6 +2713,26 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   thread.environmentId,
                 );
           if (preset) attemptSnooze(threadRef, preset);
+          return;
+        }
+        if (clicked.value === "settle-bridge" || clicked.value.startsWith("settle-bridge:")) {
+          const issue = bridgeIssueForAction(thread.issues, clicked.value);
+          if (issue === undefined) return;
+          try {
+            await api.shell.openExternal(
+              bridgeWorklogUrl({ issue, title: thread.title, now: new Date() }),
+            );
+          } catch (error) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: gt("Unable to open link."),
+                description: thrownErrorMessage(error, m) ?? gt("An error occurred."),
+              }),
+            );
+            return;
+          }
+          attemptSettle(threadRef);
           return;
         }
         switch (clicked.value) {

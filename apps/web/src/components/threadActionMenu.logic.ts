@@ -1,8 +1,9 @@
-import type { ContextMenuItem } from "@t3tools/contracts";
+import type { ContextMenuItem, ThreadIssueLink } from "@t3tools/contracts";
 import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled";
 import { msg } from "gt-react";
 
 import { m, type MessageResolver } from "../i18n/messages";
+import { jiraIssues } from "../lib/bridgeWorklog";
 
 export type ThreadActionMenuId =
   | "find"
@@ -13,6 +14,8 @@ export type ThreadActionMenuId =
   | "pin"
   | "unpin"
   | "settle"
+  | "settle-bridge"
+  | `settle-bridge:${number}`
   | "unsettle"
   | "auto-settle"
   | "auto-settle:enabled"
@@ -105,6 +108,7 @@ export interface ThreadActionMenuState {
   } | null;
   readonly isPinned: boolean;
   readonly isSettled: boolean;
+  readonly issues?: ReadonlyArray<ThreadIssueLink> | undefined;
   readonly autoSettleEnabled: boolean;
   readonly isSnoozed: boolean;
   readonly canSnoozeNow: boolean;
@@ -174,6 +178,24 @@ export function buildThreadActionMenuItems(
                 icon: "circle-check",
               }
             : { id: "settle" as const, label: resolve(msg("Settle thread")), icon: "circle-check" },
+        ]
+      : []),
+    ...(state.supports.settlement && !state.isSettled
+      ? [
+          {
+            id: "settle-bridge" as const,
+            label: resolve(msg("Settle and book hours")),
+            icon: "clock",
+            ...(jiraIssues(state.issues).length > 1
+              ? {
+                  children: jiraIssues(state.issues).map((issue, index) => ({
+                    id: `settle-bridge:${index}` as const,
+                    label: issue.displayKey,
+                    detail: issue.title,
+                  })),
+                }
+              : {}),
+          },
         ]
       : []),
     ...(state.supports.snooze
