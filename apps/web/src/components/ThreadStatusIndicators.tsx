@@ -419,6 +419,44 @@ export function ThreadPullRequestBadgeControl({
   const m = useMessages();
   const presentation = resolveThreadPullRequestBadgePresentation({ badge, number, url, status }, m);
   if (presentation === null) return null;
+  const linked = resolveThreadCurrentPullRequestLink(pullRequests);
+  if (
+    badge !== null &&
+    number !== undefined &&
+    url !== undefined &&
+    linked !== null &&
+    resolveThreadCurrentPullRequestLinkForBranch(pullRequests, url) === null
+  ) {
+    const snapshot = linkedPullRequestSnapshotStatus(linked);
+    return (
+      <>
+        <ThreadPullRequestBadgeControl
+          render={render}
+          badge={null}
+          pullRequests={[]}
+          number={number}
+          url={url}
+          status={status}
+          onOpenList={onOpenList}
+          onOpenPullRequest={onOpenPullRequest}
+        />
+        <ThreadPullRequestBadgeControl
+          render={render}
+          badge={badge}
+          pullRequests={pullRequests}
+          number={linked.number}
+          url={linked.url}
+          status={
+            snapshot === null
+              ? null
+              : prStatusIndicator(snapshot.pr, snapshot.sourceControlProvider, m)
+          }
+          onOpenList={onOpenList}
+          onOpenPullRequest={onOpenPullRequest}
+        />
+      </>
+    );
+  }
   return (
     <PullRequestBadge
       render={render}
@@ -461,7 +499,7 @@ function PullRequestBadge({
         event.stopPropagation();
         onOpenList();
       }
-    : onOpenPullRequest;
+    : (event: MouseEvent<HTMLElement>) => onOpenPullRequest(event, url);
   const element = opensList ? (
     <button type="button" />
   ) : (
@@ -662,6 +700,7 @@ function PrStatusTooltipContent({ status }: { status: PrStatusIndicator }) {
 export function resolveDisplayedThreadPr(input: {
   threadBranch: string | null;
   gitStatus: VcsStatusResult | null;
+  followCheckout?: boolean;
   linkedPullRequest?: ThreadLinkedPullRequest | null | undefined;
   linkedPullRequestStatus?: LinkedThreadPullRequestStatus | null | undefined;
 }): ThreadPr | null {
@@ -670,9 +709,9 @@ export function resolveDisplayedThreadPr(input: {
     return linkedPullRequestStatus?.pr ?? null;
   }
   if (
-    threadBranch !== null &&
     gitStatus !== null &&
-    gitStatus.refName === threadBranch &&
+    gitStatus.refName !== null &&
+    (input.followCheckout === true || gitStatus.refName === threadBranch) &&
     gitStatus.pr?.state === "open"
   ) {
     return gitStatus.pr;
@@ -684,6 +723,7 @@ export function resolveDisplayedThreadPr(input: {
 export function resolveDisplayedThreadPrProvider(input: {
   threadBranch: string | null;
   gitStatus: VcsStatusResult | null;
+  followCheckout?: boolean;
   linkedPullRequest?: ThreadLinkedPullRequest | null | undefined;
   linkedPullRequestStatus?: LinkedThreadPullRequestStatus | null | undefined;
 }): VcsStatusResult["sourceControlProvider"] | undefined {
@@ -884,16 +924,13 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     thread.linkedPullRequest,
     leaseLiveStatus,
     thread.pullRequests,
-    thread.branchPullRequest,
+    gitCwd === null ? thread.branchPullRequest : undefined,
   );
   const gitStatus = useEnvironmentQuery(
-    leaseLiveStatus &&
-      thread.linkedPullRequest == null &&
-      (thread.branch != null || thread.worktreePath !== null) &&
-      gitCwd !== null
+    leaseLiveStatus && gitCwd !== null
       ? vcsEnvironment.status({
           environmentId: thread.environmentId,
-          input: { cwd: gitCwd, includeRemote: false },
+          input: { cwd: gitCwd },
         })
       : null,
   );
@@ -904,13 +941,12 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
   const displayedPrInput = {
     threadBranch: thread.branch,
     gitStatus: visibleGitStatus,
-    linkedPullRequest: thread.linkedPullRequest,
-    linkedPullRequestStatus: linkedPullRequest,
+    followCheckout: true,
   };
-  const pr = linkedPullRequest?.pr ?? resolveDisplayedThreadPr(displayedPrInput);
+  const pr = resolveDisplayedThreadPr(displayedPrInput) ?? linkedPullRequest?.pr ?? null;
   const prStatus = prStatusIndicator(
     pr,
-    linkedPullRequest?.sourceControlProvider ?? resolveDisplayedThreadPrProvider(displayedPrInput),
+    resolveDisplayedThreadPrProvider(displayedPrInput) ?? linkedPullRequest?.sourceControlProvider,
     m,
   );
   const threadStatus = resolveThreadStatusPill({

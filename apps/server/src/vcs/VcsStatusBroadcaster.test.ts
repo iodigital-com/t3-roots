@@ -84,6 +84,8 @@ function layerTestFor(state: {
   backgroundWorkEnabled?: boolean;
   automaticFetchInterval?: Effect.Effect<Duration.Duration>;
   beforeRemoteStatus?: Effect.Effect<void, GitManagerError>;
+  captureRemoteResultAtStart?: boolean;
+  remoteStatusResults?: Array<VcsStatusRemoteResult | null>;
   beforeLocalStatus?: Effect.Effect<void>;
   beforeCurrentBranch?: Effect.Effect<void>;
   beforeInvalidate?: Effect.Effect<void>;
@@ -155,12 +157,17 @@ function layerTestFor(state: {
           ),
         remoteStatus: (_input, options) =>
           Effect.suspend(() => {
+            const captured = state.currentRemoteStatus;
             return (state.beforeRemoteStatus ?? Effect.void).pipe(
               Effect.andThen(
                 Effect.sync(() => {
                   state.remoteStatusCalls += 1;
                   state.remoteStatusRefreshUpstreamValues?.push(options?.refreshUpstream);
-                  return state.currentRemoteStatus;
+                  const result = state.captureRemoteResultAtStart
+                    ? captured
+                    : state.currentRemoteStatus;
+                  state.remoteStatusResults?.push(result);
+                  return result;
                 }),
               ),
               Effect.tap(() =>
@@ -1877,6 +1884,8 @@ describe("VcsStatusBroadcaster", () => {
         localInvalidationCalls: 0,
         remoteInvalidationCalls: 0,
         beforeRemoteStatus: Effect.void,
+        captureRemoteResultAtStart: true,
+        remoteStatusResults: [] as Array<VcsStatusRemoteResult | null>,
         headPath,
       };
 
@@ -1937,6 +1946,8 @@ describe("VcsStatusBroadcaster", () => {
           states.some((value) => value.refName === "third" && value.pr?.number === 3002),
         );
         assert.equal(states.at(-1)?.pr?.number, 3003);
+        assert.isTrue(state.remoteStatusResults.some((result) => result?.pr?.number === 3002));
+        assert.equal(state.remoteStatusResults.at(-1)?.pr?.number, 3003);
       }).pipe(Effect.provide(layerTestFor(state)), Effect.scoped);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
