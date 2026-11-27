@@ -2232,17 +2232,6 @@ export const layer: Layer.Layer<
           runtimePolicy: input.runtimePolicy,
           ...(appContext.length === 0 ? {} : { appContext }),
         };
-        // Check after the context read: ingestion can settle the run while
-        // it awaits. A failed ownership read fails the start below.
-        const shouldStart =
-          input.shouldStartProviderTurn === undefined
-            ? Exit.succeed(true)
-            : yield* Effect.exit(input.shouldStartProviderTurn());
-        if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
-          yield* Fiber.interrupt(providerEventFiber);
-          return;
-        }
-
         const compact =
           input.message.attachments.length === 0 &&
           input.message.text.trim().toLowerCase() === "/compact";
@@ -2277,7 +2266,29 @@ export const layer: Layer.Layer<
                   }),
                 ))
               : input.session.startTurn(turnInput);
-        yield* Effect.andThen(shouldStart, startTurn).pipe(
+        // Recheck the run after admission: Stop can settle it while startup is paused.
+        const admitted = yield* threadCommands.awaitStartAdmission(
+          Effect.gen(function* () {
+            const shouldStart =
+              input.shouldStartProviderTurn === undefined
+                ? Exit.succeed(true)
+                : yield* Effect.exit(input.shouldStartProviderTurn());
+            if (Exit.isSuccess(shouldStart) && !shouldStart.value) {
+              return { shouldStart, skipped: true as const };
+            }
+            return {
+              shouldStart,
+              skipped: false as const,
+              outcome: yield* Effect.exit(Effect.andThen(shouldStart, startTurn)),
+            };
+          }),
+        );
+        if (admitted.skipped) {
+          yield* Fiber.interrupt(providerEventFiber);
+          return;
+        }
+        const { shouldStart } = admitted;
+        yield* admitted.outcome.pipe(
           // Wait for acceptance so abandoned startup cannot leave a refresher
           // on the already-detached ingestion fiber.
           Effect.tap(() =>

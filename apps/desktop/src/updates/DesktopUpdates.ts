@@ -881,108 +881,115 @@ export const make = Effect.gen(function* () {
   });
 
   const installDownloadedUpdate = (expectedVersion?: string) =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const admission = yield* admitAfterCheck(
+    pool.quitAdmission
+      .run(
+        Effect.scoped(
           Effect.gen(function* () {
-            const state = yield* Ref.get(updateStateRef);
-            const activeAction = yield* Ref.get(activeUpdateActionRef);
-            const hasExpectedDownload =
-              state.downloadedVersion !== null &&
-              (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
-            if (
-              (yield* Ref.get(desktopState.quitting)) ||
-              !(yield* Ref.get(updaterConfiguredRef)) ||
-              !hasExpectedDownload
-            ) {
-              return "refused" as const;
+            const admission = yield* admitAfterCheck(
+              Effect.gen(function* () {
+                const state = yield* Ref.get(updateStateRef);
+                const activeAction = yield* Ref.get(activeUpdateActionRef);
+                const hasExpectedDownload =
+                  state.downloadedVersion !== null &&
+                  (expectedVersion === undefined || state.downloadedVersion === expectedVersion);
+                if (
+                  (yield* Ref.get(desktopState.quitting)) ||
+                  !(yield* Ref.get(updaterConfiguredRef)) ||
+                  !hasExpectedDownload
+                ) {
+                  return "refused" as const;
+                }
+                if (Option.isSome(activeAction)) {
+                  return activeAction.value === "check"
+                    ? ("wait-for-check" as const)
+                    : ("refused" as const);
+                }
+                const hasInstallableDownload =
+                  state.status === "downloaded" ||
+                  (state.status === "error" &&
+                    (state.errorContext === null || state.errorContext === "install"));
+                if (!hasInstallableDownload) return "refused" as const;
+                return (yield* tryStartUpdateAction("install"))
+                  ? ("admitted" as const)
+                  : ("refused" as const);
+              }),
+            );
+            if (admission === "refused") {
+              return { accepted: false, completed: false, failed: false };
             }
-            if (Option.isSome(activeAction)) {
-              return activeAction.value === "check"
-                ? ("wait-for-check" as const)
-                : ("refused" as const);
-            }
-            const hasInstallableDownload =
-              state.status === "downloaded" ||
-              (state.status === "error" &&
-                (state.errorContext === null || state.errorContext === "install"));
-            if (!hasInstallableDownload) return "refused" as const;
-            return (yield* tryStartUpdateAction("install"))
-              ? ("admitted" as const)
-              : ("refused" as const);
-          }),
-        );
-        if (admission === "refused") {
-          return { accepted: false, completed: false, failed: false };
-        }
 
-        yield* Ref.set(desktopState.quitting, true);
-        yield* Ref.set(installRunningBackendsRef, []);
+            yield* Ref.set(desktopState.quitting, true);
+            yield* Ref.set(installRunningBackendsRef, []);
 
-        return yield* Effect.gen(function* () {
-          yield* writeUpdateRestartMarker;
-          yield* writeUpdateInProgressMarker;
-          const { downloadedVersion } = yield* Ref.get(updateStateRef);
-          if (downloadedVersion !== null) yield* writeInstallRecord(downloadedVersion);
-          // Stop pooled backends and SSH tunnels before quitAndInstall can outrun their scope finalizers.
-          const instances = yield* pool.list;
-          // stop clears desiredRunning, so retain the recovery set beforehand.
-          const runningInstances = yield* Effect.filter(instances, (instance) =>
-            instance.snapshot.pipe(Effect.map((snapshot) => snapshot.desiredRunning)),
-          );
-          yield* Ref.set(installRunningBackendsRef, runningInstances);
-          yield* Effect.all(
-            [
-              Effect.forEach(
-                instances,
-                (instance) =>
-                  instance.stop({ timeout: DesktopBackendManager.BACKEND_QUIT_STOP_TIMEOUT }),
+            return yield* Effect.gen(function* () {
+              yield* writeUpdateRestartMarker;
+              yield* writeUpdateInProgressMarker;
+              const { downloadedVersion } = yield* Ref.get(updateStateRef);
+              if (downloadedVersion !== null) yield* writeInstallRecord(downloadedVersion);
+              // Stop pooled backends and SSH tunnels before quitAndInstall can outrun their scope finalizers.
+              const instances = yield* pool.list;
+              // stop clears desiredRunning, so retain the recovery set beforehand.
+              const runningInstances = yield* Effect.filter(instances, (instance) =>
+                instance.snapshot.pipe(Effect.map((snapshot) => snapshot.desiredRunning)),
+              );
+              yield* Ref.set(installRunningBackendsRef, runningInstances);
+              yield* Effect.all(
+                [
+                  Effect.forEach(
+                    instances,
+                    (instance) =>
+                      instance.stop({ timeout: DesktopBackendManager.BACKEND_QUIT_STOP_TIMEOUT }),
+                    { concurrency: "unbounded" },
+                  ),
+                  sshEnvironment.closeAllTunnels,
+                ],
                 { concurrency: "unbounded" },
-              ),
-              sshEnvironment.closeAllTunnels,
-            ],
-            { concurrency: "unbounded" },
-          );
-          yield* electronUpdater.quitAndInstall({
-            isSilent: true,
-            isForceRunAfter: true,
-          });
-          return { accepted: true, completed: false, failed: false };
-        }).pipe(
-          Effect.catchTags({
-            ElectronUpdaterQuitAndInstallError: Effect.fn("desktop.updates.handleInstallFailure")(
-              function* (error) {
-                yield* recoverFailedInstall(error.message);
-                yield* logUpdaterError(error.message, {
-                  errorTag: error._tag,
-                  cause: describeUpdateErrorCause(error.cause),
-                  channel: error.channel,
-                  isSilent: error.isSilent,
-                  isForceRunAfter: error.isForceRunAfter,
-                });
-                return { accepted: true, completed: false, failed: true };
-              },
-            ),
-          }),
-          Effect.onInterrupt(() => resetInstallAction),
-          Effect.catchCause((cause) =>
-            Effect.gen(function* () {
-              if (Cause.hasInterruptsOnly(cause)) {
-                return yield* Effect.failCause(cause);
-              }
-              const error = new DesktopUpdateUnexpectedActionError({ action: "install", cause });
-              yield* recoverFailedInstall(error.message);
-              yield* logUpdaterError(error.message, {
-                errorTag: error._tag,
-                cause: describeUpdateErrorCause(error.cause),
-                action: error.action,
+              );
+              yield* electronUpdater.quitAndInstall({
+                isSilent: true,
+                isForceRunAfter: true,
               });
-              return { accepted: true, completed: false, failed: true };
-            }),
-          ),
-        );
-      }),
-    ).pipe(Effect.withSpan("desktop.updates.installDownloadedUpdate"));
+              return { accepted: true, completed: false, failed: false };
+            }).pipe(
+              Effect.catchTags({
+                ElectronUpdaterQuitAndInstallError: Effect.fn(
+                  "desktop.updates.handleInstallFailure",
+                )(function* (error) {
+                  yield* recoverFailedInstall(error.message);
+                  yield* logUpdaterError(error.message, {
+                    errorTag: error._tag,
+                    cause: describeUpdateErrorCause(error.cause),
+                    channel: error.channel,
+                    isSilent: error.isSilent,
+                    isForceRunAfter: error.isForceRunAfter,
+                  });
+                  return { accepted: true, completed: false, failed: true };
+                }),
+              }),
+              Effect.onInterrupt(() => resetInstallAction),
+              Effect.catchCause((cause) =>
+                Effect.gen(function* () {
+                  if (Cause.hasInterruptsOnly(cause)) {
+                    return yield* Effect.failCause(cause);
+                  }
+                  const error = new DesktopUpdateUnexpectedActionError({
+                    action: "install",
+                    cause,
+                  });
+                  yield* recoverFailedInstall(error.message);
+                  yield* logUpdaterError(error.message, {
+                    errorTag: error._tag,
+                    cause: describeUpdateErrorCause(error.cause),
+                    action: error.action,
+                  });
+                  return { accepted: true, completed: false, failed: true };
+                }),
+              ),
+            );
+          }),
+        ),
+      )
+      .pipe(Effect.withSpan("desktop.updates.installDownloadedUpdate"));
 
   const installWithExpectedVersion = Effect.fn("desktop.updates.install")(function* (
     expectedVersion?: string,

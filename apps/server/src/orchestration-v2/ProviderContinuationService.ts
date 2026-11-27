@@ -15,6 +15,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import type * as Orchestrator from "./Orchestrator.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
 const CONTINUATION_MESSAGE_TEXT = "Background task completed.";
@@ -64,6 +65,7 @@ export const layer = Layer.effectDiscard(
     const ids = yield* IdAllocator.IdAllocatorV2;
     const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const retryAttempts = yield* Ref.make(new Map<string, number>());
     const continuations = yield* KeyedLock.makeRunner<ThreadId>();
 
@@ -291,6 +293,7 @@ export const layer = Layer.effectDiscard(
           }),
         );
       },
+      (effect) => threadCommands.awaitStartAdmission(effect),
     );
 
     yield* requests.take.pipe(
@@ -347,4 +350,4 @@ export const layer = Layer.effectDiscard(
       Effect.forkScoped,
     );
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));

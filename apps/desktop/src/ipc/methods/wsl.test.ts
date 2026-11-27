@@ -6,6 +6,7 @@ import * as Schema from "effect/Schema";
 
 import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
 import * as DesktopLifecycle from "../../app/DesktopLifecycle.ts";
+import * as DesktopSafeShutdown from "../../app/DesktopSafeShutdown.ts";
 import * as DesktopShutdown from "../../app/DesktopShutdown.ts";
 import * as DesktopState from "../../app/DesktopState.ts";
 import * as ElectronApp from "../../electron/ElectronApp.ts";
@@ -54,6 +55,7 @@ function layerLifecycle(relaunchReasons: Array<string>) {
 const layerUnusedLifecycleRuntime = Layer.mergeAll(
   DesktopShutdown.layer,
   DesktopState.layer,
+  Layer.mock(DesktopSafeShutdown.DesktopSafeShutdown, { commitOnQuit: Effect.succeed(true) }),
   Layer.succeed(
     DesktopEnvironment.DesktopEnvironment,
     DesktopEnvironment.DesktopEnvironment.of(

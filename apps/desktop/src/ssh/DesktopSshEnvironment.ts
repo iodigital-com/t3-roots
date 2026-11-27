@@ -71,6 +71,10 @@ export class DesktopSshEnvironment extends Context.Service<
       target: DesktopSshEnvironmentTarget,
     ) => Effect.Effect<void, DesktopSshEnvironmentOperationError>;
     readonly closeAllTunnels: Effect.Effect<void>;
+    readonly prepareTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+    readonly releaseTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+    readonly recoverTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+    readonly commitTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
   }
 >()("@t3tools/desktop/ssh/DesktopSshEnvironment") {}
 
@@ -204,6 +208,10 @@ export const make = Effect.gen(function* () {
       Effect.provide(runtimeContext),
     ),
     closeAllTunnels: manager.closeAllTunnels,
+    prepareTaggedQuit: manager.prepareTaggedQuit,
+    releaseTaggedQuit: manager.releaseTaggedQuit,
+    recoverTaggedQuit: manager.recoverTaggedQuit,
+    commitTaggedQuit: manager.commitTaggedQuit,
   });
 });
 

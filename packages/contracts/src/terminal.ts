@@ -490,6 +490,15 @@ export class TerminalNotRunningError extends Schema.TaggedError<TerminalNotRunni
   }
 }
 
+export class TerminalShutdownInProgressError extends Schema.TaggedError<TerminalShutdownInProgressError>()(
+  "TerminalShutdownInProgressError",
+  {},
+) {
+  override get message() {
+    return "T3 is preparing to shut down; opening terminals is paused.";
+  }
+}
+
 export class TerminalWriteError extends Schema.TaggedError<TerminalWriteError>()(
   "TerminalWriteError",
   {
@@ -521,6 +530,7 @@ export class TerminalResizeError extends Schema.TaggedError<TerminalResizeError>
 }
 
 export const TerminalError = Schema.Union([
+  TerminalShutdownInProgressError,
   TerminalCwdError,
   TerminalHistoryError,
   TerminalSessionLookupError,

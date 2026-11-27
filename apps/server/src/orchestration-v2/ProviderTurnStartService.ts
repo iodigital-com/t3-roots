@@ -70,6 +70,7 @@ import {
   makeProviderFailure,
 } from "@t3tools/provider-core/server/failure";
 import * as RunExecutionService from "./RunExecutionService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 import {
@@ -285,6 +286,7 @@ export const layer: Layer.Layer<
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
     const restoreMissingWorktree = yield* makeRestoreMissingWorktree;
     const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+    const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
 
     // Build draining callbacks outside startup scope so they cannot retain full thread history.
     const makeRunControls = (input: {
@@ -2162,19 +2164,21 @@ export const layer: Layer.Layer<
               (yield* projects
                 .getById(thread.projectId, { includeDeleted: true })
                 .pipe(Effect.map((project) => Option.getOrUndefined(project)?.workspaceRoot)));
-            const providerTurn = yield* cwd === undefined
-              ? start(input, captureStartingRun)
-              : withTurnStartReservation(
-                  fileSystem,
-                  path,
-                  path.resolve(cwd),
-                  thread.worktreePath === null
-                    ? start(input, captureStartingRun)
-                    : withWorkspaceLease(
-                        path.resolve(thread.worktreePath),
-                        start(input, captureStartingRun),
-                      ),
-                );
+            const providerTurn = yield* threadCommands.awaitStartAdmission(
+              cwd === undefined
+                ? start(input, captureStartingRun)
+                : withTurnStartReservation(
+                    fileSystem,
+                    path,
+                    path.resolve(cwd),
+                    thread.worktreePath === null
+                      ? start(input, captureStartingRun)
+                      : withWorkspaceLease(
+                          path.resolve(thread.worktreePath),
+                          start(input, captureStartingRun),
+                        ),
+                  ),
+            );
             if (providerTurn !== undefined) {
               // Run execution owns finalization after the running write. A later
               // failure must not settle a replacement attempt committed by steering.
@@ -2264,4 +2268,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));

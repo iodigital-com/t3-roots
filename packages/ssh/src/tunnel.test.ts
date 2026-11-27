@@ -901,6 +901,107 @@ describe("ssh tunnel scripts", () => {
     }),
   );
 
+  it.effect.each([false, true])(
+    "preserves the managed remote only after a tagged quit commits (%s)",
+    (committed) =>
+      Effect.gen(function* () {
+        let forwardsClosed = 0;
+        let remoteCommands = 0;
+        const spawner = ChildProcessSpawner.make((command) => {
+          const args = commandArgs(command);
+          if (args.includes("-G")) {
+            return Effect.succeed(makeSuccessfulProcess("hostname devbox\n"));
+          }
+          if (args.includes("-N")) {
+            return Effect.succeed(makeRunningProcess(() => forwardsClosed++));
+          }
+          remoteCommands++;
+          return Effect.succeed(
+            makeSuccessfulProcess(
+              remoteCommands === 1
+                ? '{"remotePort":3773,"serverKind":"managed"}\n'
+                : '{"stopped":true}\n',
+            ),
+          );
+        });
+        const layer = Layer.mergeAll(
+          NodeServices.layer,
+          NodeCrypto.layer,
+          Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Layer.succeed(HttpClient.HttpClient, testHttpClient),
+          Layer.succeed(NetService.NetService, testNetService),
+          SshAuth.SshPasswordPrompt.disabledLayer,
+          SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+        );
+        yield* Effect.gen(function* () {
+          const manager = yield* SshTunnel.SshEnvironmentManager;
+          yield* manager.ensureEnvironment({
+            alias: "devbox",
+            hostname: "devbox",
+            username: null,
+            port: null,
+          });
+          assert.isTrue(yield* manager.prepareTaggedQuit("lease"));
+          assert.isFalse(yield* manager.releaseTaggedQuit("other"));
+          if (committed) {
+            assert.isTrue(yield* manager.commitTaggedQuit("lease"));
+            assert.isFalse(yield* manager.releaseTaggedQuit("lease"));
+          } else {
+            assert.isTrue(yield* manager.releaseTaggedQuit("lease"));
+          }
+        }).pipe(Effect.provide(layer), Effect.scoped);
+        assert.equal(forwardsClosed, 1);
+        assert.equal(remoteCommands, committed ? 1 : 2);
+      }),
+  );
+
+  it.effect("holds SSH disconnects while a tagged quit is prepared", () =>
+    Effect.gen(function* () {
+      let remoteCommands = 0;
+      const spawner = ChildProcessSpawner.make((command) => {
+        const args = commandArgs(command);
+        if (args.includes("-G")) return Effect.succeed(makeSuccessfulProcess("hostname devbox\n"));
+        if (args.includes("-N")) return Effect.succeed(makeRunningProcess(() => undefined));
+        remoteCommands++;
+        return Effect.succeed(
+          makeSuccessfulProcess(
+            remoteCommands === 1 ? '{"remotePort":3773}\n' : '{"stopped":true}\n',
+          ),
+        );
+      });
+      const layer = Layer.mergeAll(
+        NodeServices.layer,
+        NodeCrypto.layer,
+        Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        Layer.succeed(HttpClient.HttpClient, testHttpClient),
+        Layer.succeed(NetService.NetService, testNetService),
+        SshAuth.SshPasswordPrompt.disabledLayer,
+        SshTunnel.SshEnvironmentManager.layer({ resolveCliRunner: Effect.succeed(ARCHIVE) }),
+      );
+      yield* Effect.gen(function* () {
+        const manager = yield* SshTunnel.SshEnvironmentManager;
+        const target = { alias: "devbox", hostname: "devbox", username: null, port: null };
+        yield* manager.ensureEnvironment(target);
+        assert.isTrue(yield* manager.prepareTaggedQuit("lease"));
+        const attempted = yield* Deferred.make<void>();
+        const disconnected = yield* Deferred.make<void>();
+        const disconnect = yield* Deferred.succeed(attempted, undefined).pipe(
+          Effect.andThen(manager.disconnectEnvironment(target)),
+          Effect.andThen(Deferred.succeed(disconnected, undefined)),
+          Effect.forkChild,
+        );
+        yield* Deferred.await(attempted);
+        assert.isTrue(Option.isNone(yield* Deferred.poll(disconnected)));
+        assert.equal(remoteCommands, 1);
+        assert.isTrue(yield* manager.commitTaggedQuit("lease"));
+        assert.isFalse(yield* manager.releaseTaggedQuit("lease"));
+        assert.isTrue(yield* manager.recoverTaggedQuit("lease"));
+        yield* Fiber.join(disconnect);
+        assert.equal(remoteCommands, 2);
+      }).pipe(Effect.provide(layer), Effect.scoped);
+    }),
+  );
+
   it.effect("reconnects a saved alias through the port its ssh config names now", () =>
     Effect.gen(function* () {
       let configPort = 53_791;

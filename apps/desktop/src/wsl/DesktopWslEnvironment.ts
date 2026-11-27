@@ -104,6 +104,7 @@ export class DesktopWslEnvironment extends Context.Service<
     readonly getUserHome: (distro: string | null) => Effect.Effect<Option.Option<string>>;
     // Use the distro IP to avoid unreliable wslhost localhost forwarding.
     readonly getDistroIp: (distro: string | null) => Effect.Effect<Option.Option<string>>;
+    readonly processExited: (distro: string, pid: number) => Effect.Effect<boolean>;
     readonly prepareRuntime: (
       distro: string | null,
       archive: WslRuntimeArchive,
@@ -255,6 +256,29 @@ const runWslShell = (
     timeout,
   );
 };
+
+export const processExitedImpl = Effect.fn("desktop.wsl.processExited")(function* (
+  distro: string,
+  pid: number,
+) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  const result = yield* runWslProcess(
+    [
+      ...buildDistroArgs(distro),
+      "--exec",
+      "test",
+      "-d",
+      "/proc/1",
+      "-a",
+      "!",
+      "-d",
+      `/proc/${pid}`,
+    ],
+    Stream.empty,
+    PROBE_TIMEOUT,
+  );
+  return result.transportFailure === null && result.exitCode === 0;
+});
 
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -1151,6 +1175,7 @@ export interface DesktopWslEnvironmentTestStub {
   readonly windowsToWslPath?: (distro: string | null, windowsPath: string) => Option.Option<string>;
   readonly getUserHome?: (distro: string | null) => Option.Option<string>;
   readonly getDistroIp?: (distro: string | null) => Option.Option<string>;
+  readonly processExited?: (distro: string, pid: number) => boolean;
   readonly prepareRuntime?: (
     distro: string | null,
     archive: WslRuntimeArchive,
@@ -1188,6 +1213,9 @@ export const layerTest = (stub: DesktopWslEnvironmentTestStub = {}) => {
       getDistroIp: Effect.fn("DesktopWslEnvironment.getDistroIp")(function (distro) {
         return Effect.succeed(stub.getDistroIp?.(distro) ?? Option.none<string>());
       }),
+      processExited: Effect.fn("DesktopWslEnvironment.processExited")((distro, pid) =>
+        Effect.succeed(stub.processExited?.(distro, pid) ?? false),
+      ),
       prepareRuntime: Effect.fn("DesktopWslEnvironment.prepareRuntime")(function (distro, archive) {
         return Effect.succeed(
           stub.prepareRuntime?.(distro, archive) ?? {
@@ -1288,6 +1316,9 @@ export const layer = Layer.effect(
       windowsToWslPath,
       getUserHome,
       getDistroIp,
+      processExited: Effect.fn("desktop.wsl.probeProcessExit")((distro, pid) =>
+        provideSpawner(processExitedImpl(distro, pid)),
+      ),
       prepareRuntime: Effect.fn("desktop.wsl.prepareRuntime")(function (distro, archive) {
         return provideSpawner(
           prepareWslRuntimeImpl(distro, archive, windowsToWslPath).pipe(

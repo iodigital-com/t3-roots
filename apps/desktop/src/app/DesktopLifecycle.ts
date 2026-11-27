@@ -16,6 +16,7 @@ import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import { stopChildProcessesBeforeExit, stopZygotesBeforeExit } from "./DesktopExitChildren.ts";
 import { makeComponentLogger } from "./DesktopObservability.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
+import * as DesktopSafeShutdown from "./DesktopSafeShutdown.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronTheme from "../electron/ElectronTheme.ts";
@@ -38,6 +39,7 @@ export class DesktopLifecycleRelaunchError extends Schema.TaggedError<DesktopLif
 export type DesktopLifecycleRuntimeServices =
   | DesktopEnvironment.DesktopEnvironment
   | DesktopShutdown.DesktopShutdown
+  | DesktopSafeShutdown.DesktopSafeShutdown
   | DesktopState.DesktopState
   | DesktopWindow.DesktopWindow
   | ElectronApp.ElectronApp
@@ -48,7 +50,7 @@ type DesktopLifecycleRegistrationServices =
   | ElectronWindow.ElectronWindow;
 
 /**
- * @effect-expect-leaking DesktopEnvironment | DesktopShutdown | DesktopState | DesktopWindow | ElectronApp | ElectronTheme | ElectronWindow
+ * @effect-expect-leaking DesktopEnvironment | DesktopShutdown | DesktopSafeShutdown | DesktopState | DesktopWindow | ElectronApp | ElectronTheme | ElectronWindow
  */
 export class DesktopLifecycle extends Context.Service<
   DesktopLifecycle,
@@ -163,8 +165,14 @@ function handleBeforeQuit(
     void runEffect(exitIfShutdownStalled(quit, "before-quit"));
     return;
   }
+  let allowQuit = true;
   void runEffect(
     Effect.gen(function* () {
+      const coordinated = yield* DesktopSafeShutdown.DesktopSafeShutdown;
+      if (!(yield* coordinated.commitOnQuit)) {
+        allowQuit = false;
+        return;
+      }
       const state = yield* DesktopState.DesktopState;
       const electronWindow = yield* ElectronWindow.ElectronWindow;
       yield* startWaitingForShutdown(quit);
@@ -179,6 +187,7 @@ function handleBeforeQuit(
       );
     }).pipe(Effect.withSpan("desktop.lifecycle.beforeQuit")),
   ).finally(() => {
+    if (!allowQuit) return;
     quit.phase = "allowed";
     void runEffect(
       Effect.gen(function* () {
@@ -203,6 +212,8 @@ function quitFromSignal(
   void runEffect(
     Effect.gen(function* () {
       yield* Effect.annotateCurrentSpan({ signal });
+      const coordinated = yield* DesktopSafeShutdown.DesktopSafeShutdown;
+      if (!(yield* coordinated.commitOnQuit)) return;
       const electronApp = yield* ElectronApp.ElectronApp;
       const state = yield* DesktopState.DesktopState;
       const wasQuitting = yield* Ref.getAndSet(state.quitting, true);
@@ -222,31 +233,36 @@ export const make = DesktopLifecycle.of({
     const electronApp = yield* ElectronApp.ElectronApp;
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const state = yield* DesktopState.DesktopState;
+    const coordinated = yield* DesktopSafeShutdown.DesktopSafeShutdown;
     yield* logLifecycleInfo("desktop relaunch requested", { reason });
-    yield* Effect.gen(function* () {
-      yield* Effect.yieldNow;
-      yield* Ref.set(state.quitting, true);
-      yield* requestDesktopShutdownAndWait();
-      if (environment.isDevelopment) {
-        yield* electronApp.exit(75);
-        return;
-      }
-      // Startup already acted on the app link that launched it; passing it on replays it.
-      const appLinkPrefix = `${ElectronProtocol.getDesktopScheme(environment.isDevelopment)}:`;
-      const args = yield* HostProcess.Arguments;
-      yield* electronApp.relaunch({
-        execPath: yield* HostProcess.ExecutablePath,
-        args: args.slice(1).filter((arg) => !arg.toLowerCase().startsWith(appLinkPrefix)),
-      });
-      yield* electronApp.exit(0);
-    }).pipe(
-      Effect.catchCause((cause) => {
-        const error = new DesktopLifecycleRelaunchError({ reason, cause });
-        return logLifecycleError(error.message, { error });
-      }),
-      Effect.forkDetach,
-      Effect.asVoid,
-    );
+    yield* coordinated
+      .admit(
+        Effect.gen(function* () {
+          yield* Effect.yieldNow;
+          yield* Ref.set(state.quitting, true);
+          yield* requestDesktopShutdownAndWait();
+          if (environment.isDevelopment) {
+            yield* electronApp.exit(75);
+            return;
+          }
+          // Startup already acted on the app link that launched it; passing it on replays it.
+          const appLinkPrefix = `${ElectronProtocol.getDesktopScheme(environment.isDevelopment)}:`;
+          const args = yield* HostProcess.Arguments;
+          yield* electronApp.relaunch({
+            execPath: yield* HostProcess.ExecutablePath,
+            args: args.slice(1).filter((arg) => !arg.toLowerCase().startsWith(appLinkPrefix)),
+          });
+          yield* electronApp.exit(0);
+        }),
+      )
+      .pipe(
+        Effect.catchCause((cause) => {
+          const error = new DesktopLifecycleRelaunchError({ reason, cause });
+          return logLifecycleError(error.message, { error });
+        }),
+        Effect.forkDetach,
+        Effect.asVoid,
+      );
   }),
   register: Effect.gen(function* () {
     const desktopWindow = yield* DesktopWindow.DesktopWindow;
