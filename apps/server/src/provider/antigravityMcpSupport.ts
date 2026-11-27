@@ -162,7 +162,10 @@ async function readPrivateFile(profileDirectory: string) {
     const buffer = Buffer.alloc(MAX_BYTES + 1);
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     if (bytesRead > MAX_BYTES) fail("invalid");
-    return parseAntigravityPrivateMcp(buffer.subarray(0, bytesRead).toString("utf8"));
+    const text = buffer.subarray(0, bytesRead).toString("utf8");
+    // A blank private config file means no private servers, the same as a missing file.
+    if (text.trim() === "") return [];
+    return parseAntigravityPrivateMcp(text);
   } finally {
     await handle.close();
   }

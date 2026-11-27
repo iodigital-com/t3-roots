@@ -90,7 +90,7 @@ it("rejects inline credentials and literal placeholders without leaking values",
   ).toThrow();
 });
 it.effect(
-  "treats missing private config as empty and rejects redirected directories and hardlinked files",
+  "treats missing or blank private config as empty and rejects redirected directories and hardlinked files",
   () =>
     Effect.gen(function* () {
       const root = yield* Effect.promise(() =>
@@ -98,6 +98,16 @@ it.effect(
       );
       try {
         expect(yield* readAntigravityPrivateMcp(root)).toEqual([]);
+        yield* Effect.promise(() => NodeFSP.mkdir(NodePath.join(root, "config")));
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(NodePath.join(root, "config", "mcp_config.json"), ""),
+        );
+        expect(yield* readAntigravityPrivateMcp(root)).toEqual([]);
+        yield* Effect.promise(() =>
+          NodeFSP.writeFile(NodePath.join(root, "config", "mcp_config.json"), " \n"),
+        );
+        expect(yield* readAntigravityPrivateMcp(root)).toEqual([]);
+        yield* Effect.promise(() => NodeFSP.rm(NodePath.join(root, "config"), { recursive: true }));
         const external = NodePath.join(root, "external");
         yield* Effect.promise(() => NodeFSP.mkdir(external));
         yield* Effect.promise(() =>
