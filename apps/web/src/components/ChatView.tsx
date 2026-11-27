@@ -321,6 +321,7 @@ import {
 } from "./chat/PanelLayoutControls";
 import type { ExpandedImagePreview } from "./chat/ExpandedImagePreview";
 import { ThreadDetailsPanel } from "./chat/ThreadDetailsPanel";
+import { ThreadSpendBarSetting } from "./chat/ThreadSpendBar";
 import { NoActiveThreadState } from "./NoActiveThreadState";
 import {
   resolveEffectiveEnvMode,
@@ -3858,6 +3859,12 @@ export default function ChatView(props: ChatViewProps) {
                             )}
                           </div>
                         </ComposerSurface.Host>
+                        {isServerThread && activeThreadRef ? (
+                          <ThreadSpendBarSetting
+                            threadRef={activeThreadRef}
+                            context={activeContextWindow}
+                          />
+                        ) : null}
                         <div className="min-h-0">
                           <div
                             data-terminal-open={terminalUiState.terminalOpen ? "true" : undefined}

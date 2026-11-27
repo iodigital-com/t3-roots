@@ -21,7 +21,7 @@ export function ThreadDetailsItemsMenuItems() {
     <>
       <MenuGroup>
         <MenuGroupLabel>
-          <T>Show in thread details</T>
+          <T>Show in thread</T>
         </MenuGroupLabel>
         {THREAD_DETAILS_ITEMS.map((item) => (
           <MenuCheckboxItem
