@@ -4,6 +4,8 @@ import { threadKey } from "@t3tools/client-runtime/state/entities";
 import type { EnvironmentThreadShell, ThreadStructure } from "@t3tools/client-runtime/state/shell";
 import { collectThreadSpend, threadSpendNode, type SpendNode } from "./threadSpend.logic";
 
+const fullHistory = { hasMoreHistory: false, expanded: false, error: null };
+
 const node = (
   amount: number | null,
   children: SpendNode["children"] = [],
@@ -53,7 +55,12 @@ describe("thread spend", () => {
         source: { creationSource: "user" },
       },
     ] as unknown as EnvironmentThreadShell[];
-    const result = threadSpendNode({ environmentId: env, threadId: root }, projection, shells);
+    const result = threadSpendNode(
+      { environmentId: env, threadId: root },
+      projection,
+      shells,
+      fullHistory,
+    );
     expect(result.children).toEqual([
       { key: threadKey({ environmentId: remoteEnv, threadId: remote }), native: false },
       { key: threadKey({ environmentId: env, threadId: child }), native: true },
@@ -65,7 +72,9 @@ describe("thread spend", () => {
         { ...projection.providerThreads[0]!, forkedFrom: { providerThreadId: "earlier" } },
       ],
     } as unknown as ThreadStructure;
-    expect(threadSpendNode({ environmentId: env, threadId: root }, forked, shells)).toMatchObject({
+    expect(
+      threadSpendNode({ environmentId: env, threadId: root }, forked, shells, fullHistory),
+    ).toMatchObject({
       cost: null,
       complete: false,
     });
@@ -114,7 +123,9 @@ describe("thread spend", () => {
         },
       ],
     } as unknown as ThreadStructure;
-    const result = collectThreadSpend("root", () => threadSpendNode(ref, projection, []));
+    const result = collectThreadSpend("root", () =>
+      threadSpendNode(ref, projection, [], fullHistory),
+    );
     expect(result.totals).toEqual([{ currency: "USD", amount: 2 }]);
     expect(result.rows[1]).toMatchObject({
       label: "Review",
@@ -158,6 +169,138 @@ describe("thread spend", () => {
     expect(result.totals).toEqual([{ currency: "USD", amount: 3 }]);
     expect(result.rows.find((row) => row.key === "child")?.duplicate).toBe(true);
     expect(result.complete).toBe(false);
+  });
+
+  it("keeps a replacement native session subtotal separate from the thread total", () => {
+    const ref = { environmentId: EnvironmentId.make("local"), threadId: ThreadId.make("root") };
+    const projection = {
+      thread: { id: ref.threadId, title: "Root", activeProviderThreadId: "provider-thread" },
+      providerThreads: [
+        {
+          id: "provider-thread",
+          appThreadId: ref.threadId,
+          providerInstanceId: "account",
+          driver: "opencode",
+          forkedFrom: null,
+          nativeThreadRef: { nativeId: "session-2", strength: "strong" },
+          contextUsage: { cost: { amount: 1, currency: "USD" } },
+        },
+      ],
+      providerTurns: [],
+      subagents: [],
+    } as unknown as ThreadStructure;
+    expect(threadSpendNode(ref, projection, [], fullHistory).complete).toBe(false);
+    const unidentified = {
+      ...projection,
+      providerThreads: [{ ...projection.providerThreads[0]!, nativeThreadRef: null }],
+    } as unknown as ThreadStructure;
+    expect(threadSpendNode(ref, unidentified, [], fullHistory).complete).toBe(false);
+    for (const nativeThreadRef of [
+      { nativeId: "session-1", strength: "strong" },
+      { nativeId: "session-2", strength: "strong" },
+      undefined,
+    ]) {
+      const changed = {
+        ...projection,
+        providerTurns: [
+          {
+            providerThreadId: "provider-thread",
+            ...(nativeThreadRef ? { nativeThreadRef } : {}),
+          },
+        ],
+      } as unknown as ThreadStructure;
+      const result = collectThreadSpend("root", () =>
+        threadSpendNode(ref, changed, [], fullHistory),
+      );
+      expect(result.totals).toEqual([{ currency: "USD", amount: 1 }]);
+      expect(result.complete).toBe(nativeThreadRef?.nativeId === "session-2");
+    }
+  });
+
+  it("keeps session coverage unknown after older chat pages load without provider turns", () => {
+    const ref = { environmentId: EnvironmentId.make("local"), threadId: ThreadId.make("root") };
+    const projection = {
+      thread: { id: ref.threadId, title: "Root", activeProviderThreadId: "provider-thread" },
+      providerThreads: [
+        {
+          id: "provider-thread",
+          appThreadId: ref.threadId,
+          providerInstanceId: "account",
+          driver: "opencode",
+          forkedFrom: null,
+          nativeThreadRef: { nativeId: "session-2", strength: "strong" },
+          contextUsage: { cost: { amount: 1, currency: "USD" } },
+        },
+      ],
+      providerTurns: [
+        {
+          providerThreadId: "provider-thread",
+          nativeThreadRef: { nativeId: "session-2", strength: "strong" },
+        },
+      ],
+      subagents: [],
+    } as unknown as ThreadStructure;
+    for (const history of [
+      { ...fullHistory, hasMoreHistory: true },
+      { ...fullHistory, hasMoreHistory: false, expanded: true },
+      { ...fullHistory, error: "History could not load" },
+      fullHistory,
+    ]) {
+      const result = collectThreadSpend("root", () =>
+        threadSpendNode(ref, projection, [], history),
+      );
+      expect(result.totals).toEqual([{ currency: "USD", amount: 1 }]);
+      expect(result.complete).toBe(history === fullHistory);
+    }
+  });
+
+  it("keeps independent accounts and environments with identical native ids separate", () => {
+    const root = { environmentId: EnvironmentId.make("local"), threadId: ThreadId.make("root") };
+    for (const [environment, account] of [
+      ["remote", "account-1"],
+      ["local", "account-2"],
+    ]) {
+      const child = {
+        environmentId: EnvironmentId.make(environment!),
+        threadId: ThreadId.make("child"),
+      };
+      const projection = (ref: typeof root, amount: number, providerInstanceId: string) =>
+        ({
+          thread: {
+            id: ref.threadId,
+            title: String(ref.threadId),
+            activeProviderThreadId: "provider-thread",
+          },
+          providerThreads: [
+            {
+              id: "provider-thread",
+              appThreadId: ref.threadId,
+              providerInstanceId,
+              driver: "opencode",
+              forkedFrom: null,
+              nativeThreadRef: { nativeId: "session-1", strength: "strong" },
+              contextUsage: { cost: { amount, currency: "USD" } },
+            },
+          ],
+          providerTurns: [],
+          subagents:
+            ref.threadId === root.threadId
+              ? [
+                  {
+                    origin: "app_owned",
+                    remoteChild: { environmentId: child.environmentId, threadId: child.threadId },
+                  },
+                ]
+              : [],
+        }) as unknown as ThreadStructure;
+      const nodes: Record<string, SpendNode> = {
+        [threadKey(root)]: threadSpendNode(root, projection(root, 1, "account-1"), [], fullHistory),
+        [threadKey(child)]: threadSpendNode(child, projection(child, 2, account!), [], fullHistory),
+      };
+      const result = collectThreadSpend(threadKey(root), (key) => nodes[key] ?? null);
+      expect(result.totals).toEqual([{ currency: "USD", amount: 3 }]);
+      expect(result.rows.some((row) => row.duplicate)).toBe(false);
+    }
   });
 
   it("does not combine currencies or claim completeness for uncertain session scope", () => {

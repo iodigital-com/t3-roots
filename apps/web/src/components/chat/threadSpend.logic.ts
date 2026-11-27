@@ -1,6 +1,7 @@
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { threadKey } from "@t3tools/client-runtime/state/entities";
 import type { EnvironmentThreadShell, ThreadStructure } from "@t3tools/client-runtime/state/shell";
+import type { ThreadHistoryMeta } from "@t3tools/client-runtime/state/threads";
 import type { ScopedThreadRef } from "@t3tools/contracts";
 
 export interface SpendCost {
@@ -124,6 +125,7 @@ export function threadSpendNode(
   ref: ScopedThreadRef,
   projection: ThreadStructure,
   shells: ReadonlyArray<EnvironmentThreadShell>,
+  history: Pick<ThreadHistoryMeta, "hasMoreHistory" | "expanded" | "error">,
 ): SpendNode {
   const providerThreads = projection.providerThreads.filter(
     (thread) =>
@@ -132,6 +134,8 @@ export function threadSpendNode(
   const active = providerThreads.find(
     (thread) => thread.id === projection.thread.activeProviderThreadId,
   );
+  const activeNativeId =
+    active?.nativeThreadRef?.strength === "strong" ? active.nativeThreadRef.nativeId : null;
   const children = new Map<string, boolean>();
   const nativeSessions = new Map<string, { key: string; label: string; cost: SpendCost | null }>();
   let unknownChildren = false;
@@ -182,13 +186,29 @@ export function threadSpendNode(
       : {
           costIdentity:
             active.nativeThreadRef?.strength === "strong" && active.nativeThreadRef.nativeId
-              ? JSON.stringify([active.driver, active.nativeThreadRef.nativeId])
-              : JSON.stringify([ref.environmentId, active.id]),
+              ? JSON.stringify([
+                  ref.environmentId,
+                  active.providerInstanceId,
+                  active.driver,
+                  active.nativeThreadRef.nativeId,
+                ])
+              : JSON.stringify([ref.environmentId, active.providerInstanceId, active.id]),
         }),
     // A fork can carry a predecessor's ledger; multiple sessions can overlap or be missing.
     complete:
+      !history.hasMoreHistory &&
+      !history.expanded &&
+      history.error === null &&
       providerThreads.length === 1 &&
       active?.forkedFrom === null &&
+      Boolean(activeNativeId) &&
+      projection.providerTurns.length > 0 &&
+      projection.providerTurns.every(
+        (turn) =>
+          turn.providerThreadId === active.id &&
+          turn.nativeThreadRef?.strength === "strong" &&
+          turn.nativeThreadRef.nativeId === activeNativeId,
+      ) &&
       !projection.providerTurns.some(
         (turn) => turn.turnTokenUsage?.hasSubagents || turn.turnTokenUsage?.otherUsage,
       ),

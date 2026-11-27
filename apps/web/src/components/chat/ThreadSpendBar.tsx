@@ -51,11 +51,12 @@ function ThreadSpendBar({
       if (get(environmentThreadDetails.statusAtom(ref)) !== "live") return null;
       const projection = get(environmentThreadDetails.quietThreadAtom(ref))?.projection;
       if (!projection) return null;
-      const node = threadSpendNode(ref, projection, shells);
-      // Older pages can contain more children or provider sessions than this snapshot.
-      return get(environmentThreadDetails.historyAtom(ref)).hasMoreHistory
-        ? { ...node, complete: false }
-        : node;
+      return threadSpendNode(
+        ref,
+        projection,
+        shells,
+        get(environmentThreadDetails.historyAtom(ref)),
+      );
     });
   });
   const spend = useAtomValue(spendAtom);
