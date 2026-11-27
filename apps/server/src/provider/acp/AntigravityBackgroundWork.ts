@@ -50,7 +50,12 @@ function varintField(bytes: Uint8Array, wanted: number): number | undefined {
   return undefined;
 }
 
-const readLatestStep = (profileDirectory: string, sessionId: string) =>
+const readLatestStep = (
+  profileDirectory: string,
+  sessionId: string,
+  toolCallId?: string,
+  consumed?: { readonly text: string; readonly from: number },
+) =>
   Effect.tryPromise({
     try: async () => {
       if (!NATIVE_ID.test(sessionId)) return undefined;
@@ -78,6 +83,69 @@ const readLatestStep = (profileDirectory: string, sessionId: string) =>
         )
           return undefined;
         const planner = row.step_type === 15 ? field(row.step_payload, 20) : undefined;
+        let originIndex: number | undefined;
+        if (toolCallId !== undefined && toolCallId.length > 0 && toolCallId.length <= 512) {
+          const candidates = db
+            .prepare(
+              "SELECT idx, step_payload FROM steps WHERE step_type = 132 AND step_format = 0 AND length(step_payload) <= ? AND instr(step_payload, ?) > 0 ORDER BY idx DESC LIMIT 16",
+            )
+            .all(MAX_STEP_BYTES, new TextEncoder().encode(toolCallId));
+          for (const candidate of candidates) {
+            if (
+              typeof candidate.idx !== "number" ||
+              !Number.isSafeInteger(candidate.idx) ||
+              !(candidate.step_payload instanceof Uint8Array)
+            )
+              continue;
+            try {
+              const call = field(field(candidate.step_payload, 5), 4);
+              if (
+                text(call, 1) === toolCallId &&
+                (text(call, 2) === "schedule" || text(call, 2) === "run_command") &&
+                text(field(candidate.step_payload, 148), 1) === `${sessionId}/task-${candidate.idx}`
+              ) {
+                originIndex = candidate.idx;
+                break;
+              }
+            } catch {
+              // A malformed step does not prove an origin.
+            }
+          }
+        }
+        let consumedReplyIndex: number | undefined;
+        if (consumed !== undefined && (toolCallId === undefined || originIndex !== undefined)) {
+          const from = Math.max(consumed.from, originIndex === undefined ? 0 : originIndex + 1);
+          const candidates = db
+            .prepare(
+              "SELECT idx, step_format, CASE WHEN length(step_payload) <= ? THEN step_payload END AS step_payload FROM steps WHERE idx >= ? AND idx <= ? AND step_type = 15 ORDER BY idx ASC LIMIT 64",
+            )
+            .iterate(MAX_STEP_BYTES, from, row.idx);
+          for (const candidate of candidates) {
+            if (
+              typeof candidate.idx !== "number" ||
+              candidate.step_format !== 0 ||
+              !(candidate.step_payload instanceof Uint8Array)
+            )
+              break;
+            try {
+              const payload = candidate.step_payload;
+              const candidatePlanner = field(payload, 20);
+              if (candidatePlanner === undefined) break;
+              // An unfinished or unrecognized planner cannot safely be skipped.
+              if (varintField(payload, 4) !== 3) break;
+              if (
+                !protoFields(candidatePlanner).some(([number]) => number === 7) &&
+                text(candidatePlanner, 1)?.trim() === consumed.text
+              ) {
+                consumedReplyIndex = candidate.idx;
+                break;
+              }
+            } catch {
+              // Do not identify a later reply across an unreadable planner.
+              break;
+            }
+          }
+        }
         return {
           index: row.idx,
           type: row.step_type,
@@ -87,6 +155,8 @@ const readLatestStep = (profileDirectory: string, sessionId: string) =>
             planner === undefined || protoFields(planner).some(([number]) => number === 7),
           dev: file.info.dev,
           ino: file.info.ino,
+          originIndex,
+          consumedReplyIndex,
         };
       } finally {
         db.close();
@@ -99,29 +169,140 @@ const readLatestStep = (profileDirectory: string, sessionId: string) =>
 export const watchAntigravityBackgroundReply = Effect.fn("watchAntigravityBackgroundReply")(
   function* (profileDirectory: string, sessionId: string) {
     const before = yield* readLatestStep(profileDirectory, sessionId);
-    return (reply: string) =>
-      before === undefined
-        ? Effect.succeed("unknown" as const)
-        : readLatestStep(profileDirectory, sessionId).pipe(
-            Effect.map((step): AcpBackgroundReplyState => {
+    let identity = before === undefined ? undefined : { dev: before.dev, ino: before.ino };
+    let runningIndex = before?.type === 15 && before.status === 8 ? before.index : undefined;
+    let floor = before?.index;
+    let consumedIndex: number | undefined;
+    let recoveredOrigin: string | undefined;
+    let awaitingFloor = false;
+    let generation = 0;
+    return (reply: string, toolCallId?: string, consumed = false) =>
+      Effect.suspend(() => {
+        if (consumed) {
+          generation += 1;
+          awaitingFloor = true;
+          recoveredOrigin = undefined;
+        }
+        const currentGeneration = generation;
+        const trimmed = reply.trim();
+        const from =
+          floor === undefined
+            ? undefined
+            : Math.max(
+                floor + (runningIndex === floor && consumedIndex !== floor ? 0 : 1),
+                (consumedIndex ?? -1) + 1,
+                runningIndex ?? 0,
+              );
+        return readLatestStep(
+          profileDirectory,
+          sessionId,
+          before === undefined ? toolCallId : undefined,
+          consumed && trimmed && from !== undefined ? { text: trimmed, from } : undefined,
+        ).pipe(
+          Effect.map((step): AcpBackgroundReplyState => {
+            if (currentGeneration !== generation) return "unknown";
+            if (step === undefined) return "unknown";
+            if (identity === undefined) identity = { dev: step.dev, ino: step.ino };
+            if (step.dev !== identity.dev || step.ino !== identity.ino) return "unknown";
+            if (before === undefined) {
               if (
-                step === undefined ||
-                step.dev !== before.dev ||
-                step.ino !== before.ino ||
-                step.index < before.index ||
-                (step.index === before.index && !(before.type === 15 && before.status === 8)) ||
-                step.type !== 15
+                toolCallId === undefined ||
+                step.originIndex === undefined ||
+                step.index < step.originIndex ||
+                (recoveredOrigin !== undefined && recoveredOrigin !== toolCallId)
               )
                 return "unknown";
-              if (step.status === 8) return "running";
-              return step.status === 3 &&
-                !step.hasToolCalls &&
-                reply.trim().length > 0 &&
-                step.reply?.trim() === reply.trim()
-                ? "completed"
-                : "unknown";
-            }),
-          );
+              recoveredOrigin = toolCallId;
+            }
+            if (consumed) {
+              const match = step.consumedReplyIndex;
+              const index =
+                match !== undefined &&
+                floor !== undefined &&
+                (match > floor || (match === floor && runningIndex === floor)) &&
+                (consumedIndex === undefined || match > consumedIndex) &&
+                (runningIndex === undefined || match >= runningIndex)
+                  ? match
+                  : step.index;
+              if (
+                (floor === undefined || index >= floor) &&
+                (runningIndex === undefined || index >= runningIndex) &&
+                (consumedIndex === undefined || index >= consumedIndex)
+              ) {
+                floor = index;
+                consumedIndex = index;
+                runningIndex = undefined;
+                awaitingFloor = false;
+              }
+              recoveredOrigin = undefined;
+              return "unknown";
+            }
+            if (awaitingFloor) {
+              if (
+                (floor === undefined || step.index >= floor) &&
+                (runningIndex === undefined || step.index >= runningIndex) &&
+                (consumedIndex === undefined || step.index >= consumedIndex)
+              ) {
+                floor = step.index;
+                consumedIndex = step.index;
+                runningIndex = undefined;
+                awaitingFloor = false;
+              }
+              return "unknown";
+            }
+            if (before === undefined) {
+              if (floor === undefined) {
+                // A completed planner can be an older reply even when it follows the task.
+                // Record it as a floor; a matching running planner can be followed immediately.
+                floor = step.index;
+                const streamed = reply.trim();
+                const nativeText = step.reply?.trim();
+                if (
+                  step.type !== 15 ||
+                  step.status !== 8 ||
+                  step.originIndex === undefined ||
+                  step.index <= step.originIndex ||
+                  !streamed ||
+                  !nativeText ||
+                  !(nativeText.startsWith(streamed) || streamed.startsWith(nativeText))
+                )
+                  return "unknown";
+                runningIndex = step.index;
+                return "running";
+              }
+            }
+            if (
+              floor === undefined ||
+              step.index < floor ||
+              (consumedIndex !== undefined && step.index <= consumedIndex) ||
+              (runningIndex !== undefined && step.index < runningIndex) ||
+              step.type !== 15
+            )
+              return "unknown";
+            if (step.status === 8) {
+              if (step.index === floor && runningIndex !== step.index) {
+                const streamed = reply.trim();
+                const nativeText = step.reply?.trim();
+                if (
+                  !streamed ||
+                  !nativeText ||
+                  !(nativeText.startsWith(streamed) || streamed.startsWith(nativeText))
+                )
+                  return "unknown";
+              }
+              runningIndex = step.index;
+              return "running";
+            }
+            if (step.index === floor && runningIndex !== step.index) return "unknown";
+            return step.status === 3 &&
+              !step.hasToolCalls &&
+              reply.trim().length > 0 &&
+              step.reply?.trim() === reply.trim()
+              ? "completed"
+              : "unknown";
+          }),
+        );
+      });
   },
 );
 

@@ -1,6 +1,7 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import {
   ChatFileAttachment,
   MessageId,
@@ -40,6 +41,7 @@ import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
+import * as BackgroundWork from "../../provider/acp/AntigravityBackgroundWork.ts";
 import {
   backgroundStep,
   makeProfile,
@@ -1272,6 +1274,366 @@ const openSessionWithRunningCommand = Effect.fn("openSessionWithRunningCommand")
 });
 
 describe("AntigravityAdapterV2 work after the prompt ends", () => {
+  it.effect("keeps the early native baseline when the timer update arrives after its reply", () =>
+    Effect.gen(function* () {
+      const { profile, databasePath } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [[3, 15, plannerReplyStep(3, "previous reply")]],
+      });
+      const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+        onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+      });
+      yield* opened.startTurn(1, false);
+      yield* opened.throughPromptSettled;
+      // The database can advance before ACP delivers the tool completion and text.
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer completed."));
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Timer completed." },
+      });
+      const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), "completed");
+      const result = (yield* Fiber.join(terminal)).at(-1);
+      assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect.each([false, true])(
+    "recovers an initially unreadable native reply (past fallback: %s)",
+    (pastFallback) =>
+      Effect.gen(function* () {
+        const { profile, databasePath } = yield* makeProfile({
+          rootSessionId: "mock-session-1",
+          steps: () => [
+            [2, 132, backgroundStep("call_timer", "schedule", "mock-session-1/task-2")],
+            [3, 15, plannerReplyStep(3, "previous reply")],
+          ],
+        });
+        const fs = yield* FileSystem.FileSystem;
+        const heldPath = `${databasePath}.held`;
+        yield* fs.rename(databasePath, heldPath);
+        const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+        const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+          onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+        });
+        yield* opened.startTurn(1, false);
+        yield* opened.throughPromptSettled;
+        yield* opened.send({
+          sessionUpdate: "tool_call_update",
+          ...opened.command,
+          status: "completed",
+        });
+        yield* fs.rename(heldPath, databasePath);
+        yield* putStep(databasePath, 5, 15, plannerReplyStep(8, "Timer completed."));
+        yield* opened.send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Timer completed." },
+        });
+        const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "running");
+        if (pastFallback) {
+          yield* TestClock.adjust("2 minutes");
+          assert.isUndefined(terminal.pollUnsafe(), "known native work must remain active");
+        }
+        yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer completed."));
+        yield* TestClock.adjust("3 seconds");
+        const result = (yield* Fiber.join(terminal)).at(-1);
+        assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("uses a recovered native baseline when the reply completes without another chunk", () =>
+    Effect.gen(function* () {
+      const { profile, databasePath } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [
+          [2, 132, backgroundStep("call_timer", "schedule", "mock-session-1/task-2")],
+          [3, 15, plannerReplyStep(3, "Timer completed.")],
+        ],
+      });
+      const fs = yield* FileSystem.FileSystem;
+      const heldPath = `${databasePath}.held`;
+      yield* fs.rename(databasePath, heldPath);
+      const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+        onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+      });
+      yield* opened.startTurn(1, false);
+      yield* opened.throughPromptSettled;
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* fs.rename(heldPath, databasePath);
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Timer completed." },
+      });
+      const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), "unknown", "the old matching reply is not proof");
+      assert.isUndefined(terminal.pollUnsafe());
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Timer completed."));
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), "completed");
+      const result = (yield* Fiber.join(terminal)).at(-1);
+      assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect.each([
+    { name: "the prior reply is still latest", ahead: false, next: "Done" },
+    { name: "the next reply is already recorded", ahead: true, next: "Next" },
+    { name: "the next recorded reply has identical text", ahead: true, next: "Done" },
+  ])("tracks a second timer wake when $name", ({ ahead, next }) =>
+    Effect.gen(function* () {
+      const { profile, databasePath } = yield* makeProfile({
+        rootSessionId: "mock-session-1",
+        steps: () => [[3, 15, plannerReplyStep(3, "previous")]],
+      });
+      const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+      const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+        onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+      });
+      yield* opened.startTurn(1, false);
+      yield* opened.throughPromptSettled;
+      const second = { ...opened.command, toolCallId: "call_timer_2" };
+      yield* opened.send({ sessionUpdate: "tool_call", ...second, status: "in_progress" });
+      yield* opened.send({
+        sessionUpdate: "tool_call_update",
+        ...opened.command,
+        status: "completed",
+      });
+      yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Done"));
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Done" },
+      });
+      if (ahead) yield* putStep(databasePath, 7, 15, plannerReplyStep(3, next));
+      yield* opened.send(opened.usage);
+      yield* opened.send({ sessionUpdate: "tool_call_update", ...second, status: "completed" });
+      yield* opened.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: next },
+      });
+      const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Queue.take(checked), ahead ? "completed" : "unknown");
+      if (!ahead) {
+        assert.isUndefined(terminal.pollUnsafe());
+        yield* putStep(databasePath, 7, 15, plannerReplyStep(3, "Done"));
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "completed");
+      }
+      const result = (yield* Fiber.join(terminal)).at(-1);
+      assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect.each([false, true])(
+    "consumes a buffered reply's usage before matching an identical later wake (live arrival: %s)",
+    (live) =>
+      Effect.gen(function* () {
+        const consuming = yield* Deferred.make<void>();
+        const releaseConsume = yield* Deferred.make<void>();
+        if (live) {
+          const originalWatch = BackgroundWork.watchAntigravityBackgroundReply;
+          let hold = true;
+          yield* Effect.acquireRelease(
+            Effect.sync(() =>
+              vi
+                .spyOn(BackgroundWork, "watchAntigravityBackgroundReply")
+                .mockImplementation((profile, session) =>
+                  originalWatch(profile, session).pipe(
+                    Effect.map((check) => (text, id, consumed) => {
+                      if (!consumed || !hold) return check(text, id, consumed);
+                      hold = false;
+                      return Deferred.succeed(consuming, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseConsume)),
+                        Effect.andThen(check(text, id, consumed)),
+                      );
+                    }),
+                  ),
+                ),
+            ),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+        }
+        const { profile, databasePath } = yield* makeProfile({
+          rootSessionId: "mock-session-1",
+          steps: () => [
+            [2, 132, backgroundStep("call_timer", "schedule", "mock-session-1/task-2")],
+            [3, 15, plannerReplyStep(3, "previous")],
+            [4, 132, backgroundStep("call_timer_2", "schedule", "mock-session-1/task-4")],
+          ],
+        });
+        const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+        const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+          onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+        });
+        yield* opened.startTurn(1, false);
+        const initial = yield* opened.throughPromptSettled;
+        const turn = initial.find((event) => event.type === "provider_turn.updated");
+        if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+        const second = { ...opened.command, toolCallId: "call_timer_2" };
+        yield* opened.send({ sessionUpdate: "tool_call", ...second, status: "in_progress" });
+        yield* opened.session.interruptTurn({
+          providerThread: opened.providerThread,
+          providerTurnId: turn.providerTurn.id,
+        });
+        yield* opened.throughTerminal;
+        yield* putStep(databasePath, 5, 15, plannerReplyStep(3, "Done"));
+        yield* opened.send({
+          sessionUpdate: "tool_call_update",
+          ...opened.command,
+          status: "completed",
+        });
+        yield* opened.send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Done" },
+        });
+        yield* opened.send(opened.usage);
+        yield* opened.send({ sessionUpdate: "tool_call_update", ...second, status: "completed" });
+        if (!live) {
+          yield* opened.send({
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Done" },
+          });
+        }
+        assert.lengthOf(opened.offers, 1);
+        yield* opened.offers[0]!.dispatchIfCurrent!(Effect.void);
+        const replay = yield* opened.startTurn(2, true).pipe(Effect.forkScoped);
+        if (live) {
+          yield* Deferred.await(consuming);
+          const arriving = yield* Deferred.make<void>();
+          const incoming = yield* Effect.gen(function* () {
+            yield* Deferred.succeed(arriving, undefined);
+            yield* opened.send({
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Done" },
+            });
+          }).pipe(Effect.forkScoped);
+          yield* Deferred.await(arriving);
+          yield* Deferred.succeed(releaseConsume, undefined);
+          yield* Fiber.join(replay);
+          yield* Fiber.join(incoming);
+        } else {
+          yield* Fiber.join(replay);
+        }
+        const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "unknown");
+        assert.isUndefined(terminal.pollUnsafe(), "the second reply has no completion record yet");
+        yield* putStep(databasePath, 7, 15, plannerReplyStep(3, "Done"));
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "completed");
+        const result = (yield* Fiber.join(terminal)).at(-1);
+        assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect.each([
+    { ending: "interrupted", partial: false, late: false },
+    { ending: "interrupted", partial: true, late: false },
+    { ending: "released", partial: true, late: false },
+    { ending: "interrupted", partial: true, late: true },
+  ] as const)(
+    "recovers a running timer reply replayed after $ending (partial: $partial, later timer: $late)",
+    ({ ending, partial, late }) =>
+      Effect.gen(function* () {
+        const { profile, databasePath } = yield* makeProfile({
+          rootSessionId: "mock-session-1",
+          steps: () => [
+            [2, 132, backgroundStep("call_timer", "schedule", "mock-session-1/task-2")],
+            ...(late
+              ? [
+                  [
+                    4,
+                    132,
+                    backgroundStep("call_late", "schedule", "mock-session-1/task-4"),
+                  ] as const,
+                ]
+              : []),
+            [late ? 5 : 3, 15, plannerReplyStep(3, "previous reply")],
+          ],
+        });
+        const fs = yield* FileSystem.FileSystem;
+        const heldPath = `${databasePath}.held`;
+        yield* fs.rename(databasePath, heldPath);
+        const checked = yield* Queue.unbounded<"running" | "completed" | "unknown">();
+        const opened = yield* openSessionWithRunningCommand({}, profile, undefined, true, true, {
+          onBackgroundReplyChecked: (state) => Queue.offer(checked, state).pipe(Effect.asVoid),
+        });
+        yield* opened.startTurn(1, false);
+        const initial = yield* opened.throughPromptSettled;
+        const turn = initial.find((event) => event.type === "provider_turn.updated");
+        if (turn?.type !== "provider_turn.updated") return assert.fail("the turn must start");
+        const timer = late ? { ...opened.command, toolCallId: "call_late" } : opened.command;
+        if (late) {
+          yield* fs.rename(heldPath, databasePath);
+          assert.isDefined(opened.session.awaitBackgroundTasks);
+          yield* opened.session.awaitBackgroundTasks!({
+            providerThread: opened.providerThread,
+            taskIds: ["mock-session-1/task-2"],
+            awaited: false,
+          });
+          yield* fs.rename(databasePath, heldPath);
+          yield* opened.send({ sessionUpdate: "tool_call", ...timer, status: "in_progress" });
+        }
+        if (ending === "released") {
+          yield* fs.rename(heldPath, databasePath);
+          assert.isDefined(opened.session.awaitBackgroundTasks);
+          const released = yield* opened.session.awaitBackgroundTasks!({
+            providerThread: opened.providerThread,
+            taskIds: ["mock-session-1/task-2"],
+            awaited: false,
+          });
+          assert.deepEqual(released.matched, ["mock-session-1/task-2"]);
+          yield* fs.rename(databasePath, heldPath);
+          yield* TestClock.adjust("3 seconds");
+        } else {
+          yield* opened.session.interruptTurn({
+            providerThread: opened.providerThread,
+            providerTurnId: turn.providerTurn.id,
+          });
+        }
+        yield* opened.throughTerminal;
+        yield* fs.rename(heldPath, databasePath);
+        const replyIndex = late ? 7 : 5;
+        yield* putStep(databasePath, replyIndex, 15, plannerReplyStep(8, "Timer completed."));
+        yield* opened.send({
+          sessionUpdate: "tool_call_update",
+          ...(partial ? { toolCallId: timer.toolCallId } : timer),
+          status: "completed",
+        });
+        yield* opened.send({
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Timer completed." },
+        });
+        assert.lengthOf(opened.offers, 1);
+        yield* opened.offers[0]!.dispatchIfCurrent!(Effect.void);
+        yield* opened.startTurn(2, true);
+        const terminal = yield* opened.throughTerminal.pipe(Effect.forkScoped);
+        yield* TestClock.adjust("3 seconds");
+        assert.equal(yield* Queue.take(checked), "running");
+        yield* TestClock.adjust("2 minutes");
+        assert.isUndefined(terminal.pollUnsafe(), "the replayed native reply is still running");
+        yield* putStep(databasePath, replyIndex, 15, plannerReplyStep(3, "Timer completed."));
+        yield* TestClock.adjust("3 seconds");
+        const result = (yield* Fiber.join(terminal)).at(-1);
+        assert.equal(result?.type === "turn.terminal" && result.status, "completed");
+      }).pipe(Effect.provide(layerSession)),
+  );
+
   it.effect("keeps a one-shot timer's run open through its wakeup reply", () =>
     Effect.gen(function* () {
       const { profile, databasePath } = yield* makeProfile({
