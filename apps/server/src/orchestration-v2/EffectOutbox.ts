@@ -139,6 +139,15 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
 ]);
 export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.Type;
 
+/** Effects which can start or resume agent work and must not pass a shutdown barrier. */
+export const START_EFFECT_TYPES = [
+  "provider-runtime.continue",
+  "provider-turn.start",
+  "provider-turn.restart",
+  "provider-turn.steer",
+  "runtime-request.respond",
+] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
   "provider-session.detach",
@@ -231,6 +240,10 @@ export interface EffectOutboxV2Shape {
     threadId: ThreadId,
     messageId: MessageId,
   ) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly unsettledStarts: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlyArray<string>, EffectOutboxError>;
+  readonly shutdownStopsSettled: (leaseId: string) => Effect.Effect<boolean, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -496,6 +509,36 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "first-steer", cause }),
           ),
         ),
+      unsettledStarts: (threadId) =>
+        sql<{ readonly effect_id: string }>`
+          SELECT effect_id FROM orchestration_v2_effect_outbox
+          WHERE thread_id = ${threadId}
+            AND status IN ('pending', 'running')
+            AND effect_type IN ${sql.in(START_EFFECT_TYPES)}
+          ORDER BY effect_id ASC
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.map((rows) => rows.map((row) => row.effect_id)),
+          Effect.mapError(
+            (cause) => new EffectOutboxError({ operation: "unsettled-starts", cause }),
+          ),
+        ),
+      shutdownStopsSettled: (leaseId) => {
+        const prefix = `command:safe-shutdown:${leaseId}:`;
+        // The next ASCII character bounds the prefix using the command index.
+        const upperBound = `command:safe-shutdown:${leaseId};`;
+        return sql<{ readonly pending: number }>`
+          SELECT EXISTS (
+            SELECT 1 FROM orchestration_v2_effect_outbox
+            WHERE command_id >= ${prefix} AND command_id < ${upperBound}
+              AND status != 'succeeded'
+          ) AS pending
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.map((rows) => rows[0]?.pending === 0),
+          Effect.mapError((cause) => new EffectOutboxError({ operation: "shutdown-stops", cause })),
+        );
+      },
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];

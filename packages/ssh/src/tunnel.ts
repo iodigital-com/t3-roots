@@ -14,6 +14,7 @@ import { extractJsonObject, fromLenientJson } from "@t3tools/shared/schemaJson";
 import { satisfiesSemverRange } from "@t3tools/shared/semver";
 import * as Context from "effect/Context";
 import * as Digest from "effect/crypto/Digest";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -21,9 +22,11 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { HttpClient } from "effect/http";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
@@ -191,6 +194,11 @@ export interface SshEnvironmentManagerShape {
   ) => Effect.Effect<void, SshEnvironmentEffectError, SshEnvironmentEffectContext>;
   /** Closes every tunnel, as the manager's scope finalizer does. */
   readonly closeAllTunnels: Effect.Effect<void>;
+  /** Pause tunnel changes until a tagged desktop quit is committed or cancelled. */
+  readonly prepareTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+  readonly releaseTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+  readonly recoverTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
+  readonly commitTaggedQuit: (leaseId: string) => Effect.Effect<boolean>;
 }
 
 const RemoteLaunchResult = Schema.Struct({
@@ -1766,6 +1774,66 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
   const tunnels = new Map<string, SshTunnelEntry>();
   const targetLocks = yield* KeyedLock.make<string>();
   const authSecrets = new Map<string, string>();
+  const permits = 1_000_000;
+  const admission = yield* Semaphore.make(permits);
+  const quit = yield* Ref.make<{
+    readonly leaseId: string;
+    readonly committed: boolean;
+    readonly released: Deferred.Deferred<void>;
+  } | null>(null);
+  const withAdmission: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R> =
+    Effect.fn("ssh/tunnel.withQuitAdmission")(function* <A, E, R>(
+      effect: Effect.Effect<A, E, R>,
+    ): Effect.fn.Return<A, E, R> {
+      const result = yield* admission.withPermit(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(quit);
+          return current === null
+            ? { _tag: "Done" as const, value: yield* effect }
+            : { _tag: "Wait" as const, released: current.released };
+        }),
+      );
+      if (result._tag === "Done") return result.value;
+      yield* Deferred.await(result.released);
+      return yield* Effect.suspend(() => withAdmission(effect));
+    });
+  const prepareTaggedQuit = (leaseId: string) =>
+    admission.withPermits(permits)(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(quit);
+        if (current !== null) return current.leaseId === leaseId && !current.committed;
+        yield* Ref.set(quit, {
+          leaseId,
+          committed: false,
+          released: yield* Deferred.make<void>(),
+        });
+        return true;
+      }),
+    );
+  const releaseTaggedQuit = (leaseId: string, allowCommitted = false) =>
+    admission.withPermits(permits)(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(quit);
+        if (
+          current === null ||
+          current.leaseId !== leaseId ||
+          (current.committed && !allowCommitted)
+        )
+          return false;
+        yield* Ref.set(quit, null);
+        yield* Deferred.succeed(current.released, undefined);
+        return true;
+      }),
+    );
+  const commitTaggedQuit = (leaseId: string) =>
+    admission.withPermits(permits)(
+      Effect.gen(function* () {
+        const current = yield* Ref.get(quit);
+        if (current === null || current.leaseId !== leaseId) return false;
+        yield* Ref.set(quit, { ...current, committed: true });
+        return true;
+      }),
+    );
 
   // Keep one lock per target so reconnect cannot reuse a server while stop is pending.
   const withTargetLock = Effect.fn("ssh/tunnel.withTargetLock")(function* <A, E, R>(
@@ -2004,7 +2072,7 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
             forceKillAfter: TUNNEL_SHUTDOWN_TIMEOUT_MS,
           })
           .pipe(Effect.ignore);
-        if (!stopRemote) {
+        if (!stopRemote || (yield* Ref.get(quit))?.committed === true) {
           return;
         }
         yield* Effect.logDebug("ssh.environment.tunnel.finalizer.start", {
@@ -2211,7 +2279,23 @@ const makeSshEnvironmentManager = Effect.fn("ssh/tunnel.SshEnvironmentManager.ma
     );
   });
 
-  return SshEnvironmentManager.of({ ensureEnvironment, disconnectEnvironment, closeAllTunnels });
+  return SshEnvironmentManager.of({
+    ensureEnvironment: Effect.fn("ssh/tunnel.admittedEnsureEnvironment")((target, options) =>
+      withAdmission(ensureEnvironment(target, options)),
+    ),
+    disconnectEnvironment: Effect.fn("ssh/tunnel.admittedDisconnectEnvironment")((target) =>
+      withAdmission(disconnectEnvironment(target)),
+    ),
+    closeAllTunnels: withAdmission(closeAllTunnels),
+    prepareTaggedQuit,
+    releaseTaggedQuit: Effect.fn("SshEnvironmentManager.releaseTaggedQuit")((leaseId) =>
+      releaseTaggedQuit(leaseId),
+    ),
+    recoverTaggedQuit: Effect.fn("SshEnvironmentManager.recoverTaggedQuit")((leaseId) =>
+      releaseTaggedQuit(leaseId, true),
+    ),
+    commitTaggedQuit,
+  });
 });
 
 /**

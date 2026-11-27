@@ -1,4 +1,5 @@
 import { pipe } from "effect/Function";
+import { useAtomMount } from "@effect/atom-react";
 import { changeRequestTermKind, type ChangeRequestTermKind } from "./pullRequest/changeRequestTerm";
 import {
   scopeProjectRef,
@@ -26,6 +27,7 @@ import { EnvironmentMachineIcon } from "./EnvironmentMachineIcon";
 import { useProject } from "../state/entities";
 import {
   pullRequestListLines,
+  resolveThreadCurrentPullRequestLinkForBranch,
   resolveThreadCurrentPullRequestLink,
   resolveThreadPullRequestBadge,
   resolveThreadPullRequestChains,
@@ -40,7 +42,7 @@ import { revealThreadTerminal } from "../lib/revealThreadTerminal";
 import { useEnvironmentQuery } from "../state/query";
 import { linkedPullRequestDetailAtom, useSharedPullRequestSummary } from "../state/pullRequests";
 import { useThreadRunningTerminalIds } from "../state/terminalSessions";
-import { vcsEnvironment } from "../state/vcs";
+import { vcsEnvironment, vcsBranchRevalidation } from "../state/vcs";
 import { useUiStateStore } from "../uiStateStore";
 import { sourceControlClients } from "@t3tools/client-runtime/source-control-clients";
 import {
@@ -120,7 +122,7 @@ export function useLinkedThreadPullRequest(
       };
 }
 
-/** The pull request a thread shows: its current link, else the one found for its branch. */
+/** Prefer the checked-out branch's request while retaining explicitly linked requests. */
 export function useThreadDisplayedPullRequest(
   environmentId: EnvironmentId,
   thread: Pick<
@@ -137,23 +139,25 @@ export function useThreadDisplayedPullRequest(
     thread?.linkedPullRequest,
     true,
     thread?.pullRequests,
-    thread?.branchPullRequest,
   );
   const currentLink = supportsLinks
-    ? resolveThreadCurrentPullRequestLink(thread?.pullRequests ?? [])
+    ? resolveThreadCurrentPullRequestLinkForBranch(
+        thread?.pullRequests ?? [],
+        branchPr?.url ?? null,
+      )
     : null;
-  const pr = linkedStatus?.pr ?? (currentLink === null ? branchPr : null);
+  const pr = branchPr ?? linkedStatus?.pr ?? null;
   return {
     currentLink,
     badge: supportsLinks ? resolveThreadPullRequestBadge(thread?.pullRequests) : null,
     pr,
     status: prStatusIndicator(
       pr,
-      linkedStatus?.sourceControlProvider ?? branchSourceControlProvider,
+      branchPr !== null ? branchSourceControlProvider : linkedStatus?.sourceControlProvider,
       m,
     ),
-    number: currentLink?.number ?? pr?.number,
-    url: currentLink?.url ?? pr?.url,
+    number: branchPr?.number ?? currentLink?.number ?? pr?.number,
+    url: branchPr?.url ?? currentLink?.url ?? pr?.url,
   };
 }
 
@@ -411,11 +415,49 @@ export function ThreadPullRequestBadgeControl({
   url?: string | undefined;
   status: PrStatusIndicator | null;
   onOpenList: () => void;
-  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string) => void;
+  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string, fromList?: boolean) => void;
 }) {
   const m = useMessages();
   const presentation = resolveThreadPullRequestBadgePresentation({ badge, number, url, status }, m);
   if (presentation === null) return null;
+  const linked = resolveThreadCurrentPullRequestLink(pullRequests);
+  if (
+    badge !== null &&
+    number !== undefined &&
+    url !== undefined &&
+    linked !== null &&
+    resolveThreadCurrentPullRequestLinkForBranch(pullRequests, url) === null
+  ) {
+    const snapshot = linkedPullRequestSnapshotStatus(linked);
+    return (
+      <>
+        <ThreadPullRequestBadgeControl
+          render={render}
+          badge={null}
+          pullRequests={[]}
+          number={number}
+          url={url}
+          status={status}
+          onOpenList={onOpenList}
+          onOpenPullRequest={onOpenPullRequest}
+        />
+        <ThreadPullRequestBadgeControl
+          render={render}
+          badge={badge}
+          pullRequests={pullRequests}
+          number={linked.number}
+          url={linked.url}
+          status={
+            snapshot === null
+              ? null
+              : prStatusIndicator(snapshot.pr, snapshot.sourceControlProvider, m)
+          }
+          onOpenList={onOpenList}
+          onOpenPullRequest={onOpenPullRequest}
+        />
+      </>
+    );
+  }
   return (
     <PullRequestBadge
       render={render}
@@ -450,7 +492,7 @@ function PullRequestBadge({
   status: PrStatusIndicator | null;
   pullRequests: ReadonlyArray<ThreadPullRequestLink>;
   onOpenList: () => void;
-  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string) => void;
+  onOpenPullRequest: (event: MouseEvent<HTMLElement>, url?: string, fromList?: boolean) => void;
 }) {
   const onClick = opensList
     ? (event: MouseEvent<HTMLElement>) => {
@@ -458,7 +500,7 @@ function PullRequestBadge({
         event.stopPropagation();
         onOpenList();
       }
-    : onOpenPullRequest;
+    : (event: MouseEvent<HTMLElement>) => onOpenPullRequest(event, url);
   const element = opensList ? (
     <button type="button" />
   ) : (
@@ -493,7 +535,7 @@ function PullRequestBadge({
           {visibleThreadPullRequests(pullRequests).length > 0 ? (
             <ThreadPullRequestsMiniList
               pullRequests={pullRequests}
-              onOpenPullRequest={onOpenPullRequest}
+              onOpenPullRequest={(event, url) => onOpenPullRequest(event, url, true)}
             />
           ) : number !== undefined && url !== undefined ? (
             <ul className="flex flex-col gap-1">
@@ -502,7 +544,7 @@ function PullRequestBadge({
                 url={url}
                 title={status?.tooltipTitle ?? presentation.label}
                 presentation={presentation}
-                onOpenPullRequest={onOpenPullRequest}
+                onOpenPullRequest={(event, url) => onOpenPullRequest(event, url, true)}
               />
             </ul>
           ) : null}
@@ -659,6 +701,7 @@ function PrStatusTooltipContent({ status }: { status: PrStatusIndicator }) {
 export function resolveDisplayedThreadPr(input: {
   threadBranch: string | null;
   gitStatus: VcsStatusResult | null;
+  followCheckout?: boolean;
   linkedPullRequest?: ThreadLinkedPullRequest | null | undefined;
   linkedPullRequestStatus?: LinkedThreadPullRequestStatus | null | undefined;
 }): ThreadPr | null {
@@ -667,9 +710,9 @@ export function resolveDisplayedThreadPr(input: {
     return linkedPullRequestStatus?.pr ?? null;
   }
   if (
-    threadBranch !== null &&
     gitStatus !== null &&
-    gitStatus.refName === threadBranch &&
+    gitStatus.refName !== null &&
+    (input.followCheckout === true || gitStatus.refName === threadBranch) &&
     gitStatus.pr?.state === "open"
   ) {
     return gitStatus.pr;
@@ -681,6 +724,7 @@ export function resolveDisplayedThreadPr(input: {
 export function resolveDisplayedThreadPrProvider(input: {
   threadBranch: string | null;
   gitStatus: VcsStatusResult | null;
+  followCheckout?: boolean;
   linkedPullRequest?: ThreadLinkedPullRequest | null | undefined;
   linkedPullRequestStatus?: LinkedThreadPullRequestStatus | null | undefined;
 }): VcsStatusResult["sourceControlProvider"] | undefined {
@@ -881,16 +925,30 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     thread.linkedPullRequest,
     leaseLiveStatus,
     thread.pullRequests,
-    thread.branchPullRequest,
+    gitCwd === null ? thread.branchPullRequest : undefined,
+  );
+  const branchTarget =
+    leaseLiveStatus && gitCwd !== null
+      ? { environmentId: thread.environmentId, cwd: gitCwd }
+      : null;
+  const branchStatus = useEnvironmentQuery(
+    branchTarget === null
+      ? null
+      : vcsEnvironment.branch({
+          environmentId: branchTarget.environmentId,
+          input: { cwd: branchTarget.cwd },
+        }),
+  );
+  useAtomMount(vcsBranchRevalidation(branchTarget));
+  const visibleBranchStatus = useRetainedValue(
+    JSON.stringify([thread.environmentId, gitCwd]),
+    branchStatus.data,
   );
   const gitStatus = useEnvironmentQuery(
-    leaseLiveStatus &&
-      thread.linkedPullRequest == null &&
-      (thread.branch != null || thread.worktreePath !== null) &&
-      gitCwd !== null
+    branchTarget !== null
       ? vcsEnvironment.status({
-          environmentId: thread.environmentId,
-          input: { cwd: gitCwd, includeRemote: false },
+          environmentId: branchTarget.environmentId,
+          input: { cwd: branchTarget.cwd },
         })
       : null,
   );
@@ -899,15 +957,13 @@ export function ThreadRowLeadingStatus({ thread }: { thread: SidebarThreadSummar
     gitStatus.data,
   );
   const displayedPrInput = {
-    threadBranch: thread.branch,
+    threadBranch: visibleBranchStatus?.refName ?? null,
     gitStatus: visibleGitStatus,
-    linkedPullRequest: thread.linkedPullRequest,
-    linkedPullRequestStatus: linkedPullRequest,
   };
-  const pr = linkedPullRequest?.pr ?? resolveDisplayedThreadPr(displayedPrInput);
+  const pr = resolveDisplayedThreadPr(displayedPrInput) ?? linkedPullRequest?.pr ?? null;
   const prStatus = prStatusIndicator(
     pr,
-    linkedPullRequest?.sourceControlProvider ?? resolveDisplayedThreadPrProvider(displayedPrInput),
+    resolveDisplayedThreadPrProvider(displayedPrInput) ?? linkedPullRequest?.sourceControlProvider,
     m,
   );
   const threadStatus = resolveThreadStatusPill({

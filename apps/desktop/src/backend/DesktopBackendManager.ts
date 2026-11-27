@@ -30,6 +30,7 @@ import { isRunningDatabaseMigrations } from "@t3tools/shared/databaseMigrationLo
 import { waitForHttpReady as waitForHttpReadyShared } from "@t3tools/shared/httpReadiness";
 
 import * as DesktopObservability from "../app/DesktopObservability.ts";
+import type { DesktopQuitAdmission } from "../app/DesktopQuitAdmission.ts";
 import * as DesktopTelemetryPublisher from "../telemetry/DesktopTelemetryPublisher.ts";
 import * as DesktopBrowserHost from "../preview/DesktopBrowserHost.ts";
 import * as DesktopWslEnvironment from "../wsl/DesktopWslEnvironment.ts";
@@ -219,6 +220,7 @@ export interface DesktopBackendSnapshot {
   readonly desiredRunning: boolean;
   readonly ready: boolean;
   readonly activePid: Option.Option<number>;
+  readonly activeRunId?: number;
   readonly restartAttempt: number;
   readonly restartScheduled: boolean;
 }
@@ -661,6 +663,7 @@ export const runBackendProcess = Effect.fn("runBackendProcess")(function* (
 
 export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   spec: BackendInstanceSpec,
+  quitAdmission?: DesktopQuitAdmission,
 ): Effect.fn.Return<
   DesktopBackendInstance,
   never,
@@ -706,6 +709,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       desiredRunning: current.desiredRunning,
       ready: current.ready,
       activePid: activePid(current.active),
+      ...(Option.isSome(current.active) ? { activeRunId: current.active.value.id } : {}),
       restartAttempt: current.restartAttempt,
       restartScheduled: Option.isSome(current.restartFiber),
     })),
@@ -727,7 +731,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     });
   });
 
-  const start: Effect.Effect<void> = Effect.suspend(() =>
+  const startUnadmitted: Effect.Effect<void> = Effect.suspend(() =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(state);
@@ -1038,6 +1042,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       }),
     ),
   ).pipe(Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }));
+  const start = quitAdmission === undefined ? startUnadmitted : quitAdmission.run(startUnadmitted);
 
   const scheduleRestart = Effect.fn("desktop.backendInstance.scheduleRestart")(function* (
     reason: string,

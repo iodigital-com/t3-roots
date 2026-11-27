@@ -265,6 +265,9 @@ export function BranchToolbarBranchSelector({
           input: { cwd: branchCwd },
         }),
   );
+  const liveBranchQuery = useEnvironmentQuery(
+    branchCwd === null ? null : vcsEnvironment.branch({ environmentId, input: { cwd: branchCwd } }),
+  );
   const projectStatusQuery = useEnvironmentQuery(
     activeProjectCwd === null
       ? null
@@ -334,8 +337,9 @@ export function BranchToolbarBranchSelector({
     branchRefState.data?.nextCursor !== null && branchRefState.data?.nextCursor !== undefined;
   const isFetchingNextPage = branchRefState.isFetchingNextPage;
   const isInitialBranchesLoadPending = branchRefState.isPending && branchRefState.data === null;
-  const currentGitBranch =
-    branchStatusQuery.data?.refName ?? refs.find((refName) => refName.current)?.name ?? null;
+  const currentGitBranch = liveBranchQuery.data
+    ? liveBranchQuery.data.refName
+    : (branchStatusQuery.data?.refName ?? refs.find((refName) => refName.current)?.name ?? null);
   const sourceControlPresentation = getSourceControlPresentation(
     branchStatusQuery.data?.sourceControlProvider,
   );
@@ -699,7 +703,7 @@ export function BranchToolbarBranchSelector({
   );
 
   const branchPrBranch = resolveBranchToolbarPrBranch({
-    activeThreadBranch,
+    currentGitBranch,
     resolvedActiveBranch,
   });
   const branchPr = resolveDisplayedThreadPr({

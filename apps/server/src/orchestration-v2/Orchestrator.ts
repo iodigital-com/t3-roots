@@ -1,3 +1,5 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off - A digest hides work identities in the token.
+import * as NodeCrypto from "node:crypto";
 import type {
   OrchestrationV2ThreadLinkMetadata,
   GuestShareId,
@@ -148,7 +150,7 @@ import {
   isBufferedProviderNotification,
   isUndeliveredMailboxSteer,
 } from "./NotificationMailbox.ts";
-import { EventSinkV2 } from "./EventSink.ts";
+import { CommandSequenceChanged, EventSinkV2, EventSinkWriteError } from "./EventSink.ts";
 import {
   decideGuestMessageSend,
   guestShareAfterCancelledSend,
@@ -175,6 +177,7 @@ import {
   emptyProjection,
   threadShellFromProjection,
   ProjectionStoreV2,
+  type ProjectionStoreV2Error,
   type ProjectionRecordField,
   type ProjectionTimelinePage,
   type ProjectionTimelinePageOptions,
@@ -214,6 +217,9 @@ import { planThreadDeletion } from "./ThreadDeletion.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ServerSettings from "../serverSettings.ts";
 
+const isStartAdmissionBlocked = Schema.is(ThreadCommandExecutor.StartAdmissionBlocked);
+const isEventSinkWriteError = Schema.is(EventSinkWriteError);
+const isCommandSequenceChanged = Schema.is(CommandSequenceChanged);
 const isMessageQuestionAnswer = Schema.is(
   Schema.Union([TrimmedNonEmptyString, Schema.NonEmptyArray(TrimmedNonEmptyString)]),
 );
@@ -422,6 +428,13 @@ export interface OrchestratorV2Shape {
   readonly dispatch: (
     command: OrchestrationV2ServerCommand,
   ) => Effect.Effect<OrchestratorV2DispatchResult, OrchestratorV2Error>;
+  /** Compare the work affected by Stop while holding the same thread lock as dispatch. */
+  readonly stopWorkToken: (threadId: ThreadId) => Effect.Effect<string, OrchestratorV2Error>;
+  readonly stopIfWorkUnchanged: (input: {
+    readonly threadId: ThreadId;
+    readonly commandId: CommandId;
+    readonly workToken: string;
+  }) => Effect.Effect<"stopped" | "changed", OrchestratorV2Error>;
   readonly autoArmLimitRecovery: (input: {
     readonly commandId: CommandId;
     readonly threadId: ThreadId;
@@ -1609,6 +1622,7 @@ const hasRunningDelegatedTasks = (subagents: ReadonlyArray<OrchestrationV2Subage
   );
 
 const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(function* () {
+  const reactionScope = yield* Effect.scope;
   const checkpointService = yield* CheckpointServiceV2;
   const commandPolicy = yield* CommandPolicyV2;
   const contextHandoffService = yield* ContextHandoffServiceV2;
@@ -2060,7 +2074,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return { thread, parentRun, runs, messages, subagents };
     });
 
-  const offerDelegatedCompletionDelivery =
+  const offerDelegatedCompletionDelivery: (
+    threadId: ThreadId,
+    parentRunId: RunId,
+  ) => Effect.Effect<void, ProjectionStoreV2Error> =
     /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
     Effect.fnUntraced(function* (threadId: ThreadId, parentRunId: RunId) {
       const controls = yield* projectionStore.getThreadRecords(threadId, ["runs"], {
@@ -2106,7 +2123,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (providerThread === undefined) {
         return;
       }
-      yield* continuationRequests.offer({
+      const offer = continuationRequests.offer({
         threadId,
         providerThreadId: providerThread.id,
         driver: providerThread.driver,
@@ -2118,6 +2135,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           messageId: delivery.messageId,
         },
       });
+      yield* threadDispatch.withStartAdmission(offer).pipe(
+        Effect.catchTags({
+          StartAdmissionBlocked: () =>
+            threadDispatch
+              .awaitStartAdmission(
+                threadDispatch.withLock(
+                  threadId,
+                  offerDelegatedCompletionDelivery(threadId, parentRunId),
+                ),
+              )
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to resume a delegated completion", { threadId, cause }),
+                ),
+                Effect.forkIn(reactionScope),
+                Effect.asVoid,
+              ),
+        }),
+      );
     });
 
   const offerDelegatedCompletionDeliveries =
@@ -3588,18 +3624,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const threadIds = yield* projectionStore.getRecoveryThreadIds("queued-runs");
     let resumed = 0;
     for (const threadId of threadIds) {
-      const resumedThread = yield* Effect.gen(function* () {
-        if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
-        yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
-        return true;
-      }).pipe(
-        Effect.catch((cause) =>
-          Effect.logWarning("Failed to resume queued V2 run after recovery", {
-            threadId,
-            cause,
-          }).pipe(Effect.as(false)),
-        ),
-      );
+      const resumedThread = yield* threadDispatch
+        .withStartAdmission(
+          Effect.gen(function* () {
+            if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
+            yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
+            return true;
+          }),
+        )
+        .pipe(
+          Effect.catchTags({ StartAdmissionBlocked: () => Effect.succeed(false) }),
+          Effect.catch((cause) =>
+            Effect.logWarning("Failed to resume queued V2 run after recovery", {
+              threadId,
+              cause,
+            }).pipe(Effect.as(false)),
+          ),
+        );
       if (resumedThread) {
         resumed += 1;
       }
@@ -14145,7 +14186,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   ) {
     const projection = yield* projectionStore
       .getThreadRecords(command.threadId, ["runs", "providerThreads", "turnItems", "subagents"], {
-        turnItemTypes: ["command_execution", "dynamic_tool", "subagent"],
+        turnItemTypes: ["command_execution", "dynamic_tool", "subagent", "link_request"],
         turnItemStatuses: ["pending", "running", "waiting"],
       })
       .pipe(
@@ -15917,6 +15958,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     command: OrchestrationV2ServerCommand,
     sideChatIds: ReadonlyArray<ThreadId> = [],
     cancelledTask?: OrchestrationV2Subagent,
+    expectedSequence?: number,
+    cancelStartEffects = false,
   ): Effect.fn.Return<OrchestratorV2DispatchResult, OrchestratorV2Error> {
     yield* Effect.annotateCurrentSpan({
       "orchestration_v2.command_id": command.commandId,
@@ -16050,7 +16093,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       ),
     );
 
-    if (plan.events.length === 0 && plan.effects.length === 0 && cancelledTask === undefined) {
+    if (
+      plan.events.length === 0 &&
+      plan.effects.length === 0 &&
+      cancelledTask === undefined &&
+      expectedSequence === undefined
+    ) {
       // A settle that ended nothing still records its receipt: a replayed Stop
       // effect then finds it instead of settling work that appeared since.
       const { resultSequence, inserted } = yield* Effect.gen(function* () {
@@ -16100,6 +16148,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         threadId: commandThreadId(command),
         commandType: command.type,
         acceptedAt,
+        ...(expectedSequence === undefined ? {} : { expectedSequence }),
         events:
           cancelledTask === undefined
             ? plan.events
@@ -16114,9 +16163,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }).pipe(mapDispatchError(command)),
               ],
         effects: plan.effects,
-        ...(plan.cancelUnsettledEffects === undefined
-          ? {}
-          : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
+        ...(cancelStartEffects
+          ? {
+              cancelUnsettledEffects: {
+                effectTypes: EffectOutbox.START_EFFECT_TYPES,
+                reason: "Work was stopped for coordinated shutdown.",
+              },
+            }
+          : plan.cancelUnsettledEffects === undefined
+            ? {}
+            : { cancelUnsettledEffects: plan.cancelUnsettledEffects }),
         ...(plan.updateDelegatedCompletionOnlyRunId === undefined
           ? {}
           : { updateDelegatedCompletionOnlyRunId: plan.updateDelegatedCompletionOnlyRunId }),
@@ -16261,6 +16317,135 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       : dispatch;
   });
 
+  const dispatchWithAdmission = Effect.fn("Orchestrator.dispatchWithAdmission")(function (
+    command: OrchestrationV2ServerCommand,
+  ) {
+    const startsWork =
+      command.type === "thread.create" ||
+      command.type === "thread.fork" ||
+      command.type === "thread.metadata.update" ||
+      command.type === "thread.runtime-mode.set" ||
+      command.type === "thread.pull-request.watch" ||
+      command.type === "thread.pull-request-watch.sync" ||
+      command.type === "thread.guest-message.submit" ||
+      command.type === "message.dispatch" ||
+      command.type === "notification.delivery.accept" ||
+      command.type === "link_request.record" ||
+      (command.type === "secret_request.record" && command.secretStatus !== "cancelled") ||
+      command.type === "prepared-run.release" ||
+      command.type === "prepared-run.retry" ||
+      command.type === "runtime-request.respond" ||
+      command.type === "queued-message.promote-to-steer" ||
+      command.type === "queued-run.start" ||
+      command.type === "queue.resume" ||
+      command.type === "queued-run.edit" ||
+      command.type === "delegated_task.request" ||
+      command.type === "delegated_task.remote.request";
+    const dispatch = dispatchWithReceipt(command);
+    return startsWork
+      ? threadDispatch.withStartAdmission(dispatch).pipe(
+          Effect.mapError((cause) =>
+            isStartAdmissionBlocked(cause)
+              ? new OrchestratorDispatchError({
+                  commandId: command.commandId,
+                  commandType: command.type,
+                  cause: "T3 is preparing to shut down; new work is paused.",
+                })
+              : cause,
+          ),
+        )
+      : dispatch;
+  });
+
+  // Streamed text and progress are deliberately excluded: they do not change the
+  // identities Stop reaches. A new run, request, native task, queue or watch does.
+  const readStopWorkToken = Effect.fn("Orchestrator.readStopWorkToken")(
+    function* (threadId: ThreadId) {
+      const projection = yield* projectionStore.getThreadRecords(
+        threadId,
+        ["runs", "providerThreads", "providerTurns", "turnItems", "subagents", "runtimeRequests"],
+        {
+          turnItemTypes: [
+            "command_execution",
+            "dynamic_tool",
+            "subagent",
+            "link_request",
+            "secret_request",
+          ],
+          turnItemStatuses: ["pending", "running", "waiting"],
+          runtimeRequestStatuses: ["pending"],
+        },
+      );
+      const sorted = <T extends { readonly id: string }>(values: ReadonlyArray<T>) =>
+        values.toSorted((a, b) => a.id.localeCompare(b.id));
+      const pendingStarts = yield* effectOutbox.unsettledStarts(threadId);
+      const work = {
+        threadId,
+        pendingStarts,
+        archivedAt: projection.thread.archivedAt,
+        deletedAt: projection.thread.deletedAt,
+        activeProviderThreadId: projection.thread.activeProviderThreadId,
+        limitRecovery: projection.thread.limitRecovery,
+        watches: (projection.thread.pullRequests ?? [])
+          .filter((link) => link.watch !== undefined)
+          .map(({ host, repository, number, watch }) => ({ host, repository, number, watch })),
+        runs: sorted(projection.runs).map((run) => ({
+          id: run.id,
+          status: run.status,
+          providerThreadId: run.providerThreadId,
+          activeAttemptId: run.activeAttemptId,
+          queueHeld: run.queueHeld,
+          restartContinuationOfRunId: run.restartContinuationOfRunId,
+        })),
+        providerThreads: sorted(projection.providerThreads).map((thread) => ({
+          id: thread.id,
+          providerSessionId: thread.providerSessionId,
+          nativeThreadRef: thread.nativeThreadRef,
+          status: thread.status,
+          pendingBackgroundTasks: thread.pendingBackgroundTasks,
+        })),
+        providerTurns: sorted(projection.providerTurns).map((turn) => ({
+          id: turn.id,
+          runAttemptId: turn.runAttemptId,
+          providerThreadId: turn.providerThreadId,
+          status: turn.status,
+        })),
+        turnItems: sorted(projection.turnItems).map((item) => ({
+          id: item.id,
+          type: item.type,
+          status: item.status,
+          runId: item.runId,
+          providerThreadId: item.providerThreadId,
+          providerTurnId: item.providerTurnId,
+        })),
+        subagents: sorted(projection.subagents).map((task) => ({
+          id: task.id,
+          status: task.status,
+          runId: task.runId,
+          childThreadId: task.childThreadId,
+          providerThreadId: task.providerThreadId,
+          origin: task.origin,
+          remoteChild: task.remoteChild,
+          completionDelivery: task.completionDelivery,
+        })),
+        requests: sorted(projection.runtimeRequests).map(({ id, nodeId, providerTurnId }) => ({
+          id,
+          nodeId,
+          providerTurnId,
+        })),
+      };
+      // @effect-diagnostics-next-line globalJsonInEffect:off - This is a projection of schema-decoded records, with no cycles.
+      return NodeCrypto.createHash("sha256").update(JSON.stringify(work)).digest("base64url");
+    },
+    (effect, threadId) =>
+      effect.pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause }))),
+  );
+
+  const stopSequence = (threadId: ThreadId) =>
+    eventSink
+      .latestSequence({ threadId })
+      .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+
   const handleRunUpdate = Effect.fn("Orchestrator.handleRunUpdate")(
     function* (stored: OrchestrationV2StoredEvent) {
       if (stored.event.type !== "run.updated") return;
@@ -16286,33 +16471,42 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId,
           finalizeDelegatedCompletionDelivery(threadId, run.id),
         );
-        yield* threadDispatch
-          .withLock(
-            threadId,
-            (run.status === "completed"
-              ? releaseUnattendedHolds(threadId, run.id)
-              : Effect.void
-            ).pipe(
-              Effect.andThen(
-                requeueUnreadSteers(threadId, [run.id]).pipe(
-                  Effect.catchCause((cause) =>
-                    Effect.logWarning("Failed to read unread steers", { threadId, cause }),
-                  ),
+        const advanceQueue = threadDispatch.withLock(
+          threadId,
+          (run.status === "completed"
+            ? releaseUnattendedHolds(threadId, run.id)
+            : Effect.void
+          ).pipe(
+            Effect.andThen(
+              requeueUnreadSteers(threadId, [run.id]).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to read unread steers", { threadId, cause }),
                 ),
               ),
-              Effect.andThen(
-                startNextQueuedRun(threadId, {
-                  endedRunId: run.id,
-                  ...(run.status === "failed" ? { failedRunId: run.id } : {}),
-                }),
-              ),
             ),
-          )
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
+            Effect.andThen(
+              startNextQueuedRun(threadId, {
+                endedRunId: run.id,
+                ...(run.status === "failed" ? { failedRunId: run.id } : {}),
+              }),
             ),
-          );
+          ),
+        );
+        const logQueueFailure = (cause: unknown) =>
+          Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause });
+        yield* threadDispatch.withStartAdmission(advanceQueue).pipe(
+          Effect.catchTags({
+            StartAdmissionBlocked: () =>
+              threadDispatch
+                .awaitStartAdmission(advanceQueue)
+                .pipe(
+                  Effect.catchCause(logQueueFailure),
+                  Effect.forkIn(reactionScope),
+                  Effect.asVoid,
+                ),
+          }),
+          Effect.catchCause(logQueueFailure),
+        );
       }
       const parentThreadId = yield* appOwnedSubagentParentThreadId(threadId);
       if (parentThreadId !== undefined) {
@@ -16418,6 +16612,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }
           },
           (effect, stored) => threadDispatch.withLock(stored.event.threadId, effect),
+          (effect, stored) =>
+            threadDispatch.withStartAdmission(effect).pipe(
+              Effect.catchTags({
+                StartAdmissionBlocked: () =>
+                  threadDispatch.awaitStartAdmission(effect).pipe(
+                    Effect.catchCause((cause) =>
+                      Effect.logWarning("Failed to resume deferred steering", {
+                        threadId: stored.event.threadId,
+                        cause,
+                      }),
+                    ),
+                    Effect.forkIn(reactionScope),
+                    Effect.asVoid,
+                  ),
+              }),
+            ),
           Effect.catchCause((cause) =>
             Effect.logWarning("Failed to deliver deferred steering", { cause }),
           ),
@@ -16575,14 +16785,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.forEach(
           threadIds,
           (threadId) =>
-            threadDispatch.withLock(threadId, requeueUnreadSteers(threadId)).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("Failed to requeue an unread steer during recovery", {
-                  threadId,
-                  cause,
-                }),
+            threadDispatch
+              .awaitStartAdmission(threadDispatch.withLock(threadId, requeueUnreadSteers(threadId)))
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("Failed to requeue an unread steer during recovery", {
+                    threadId,
+                    cause,
+                  }),
+                ),
               ),
-            ),
           { discard: true },
         ),
       ),
@@ -16776,36 +16988,80 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     awaitRestartContinuation: Effect.fn("OrchestratorV2.awaitRestartContinuation")(function (run) {
       return effectOutbox.awaitSettled(`effect:restart-continuation:${run.id}`).pipe(Effect.ignore);
     }),
-    dispatch: dispatchWithReceipt,
-    autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
-      return threadDispatch.withLock(
+    dispatch: dispatchWithAdmission,
+    // The projection read uses a transaction. Admission checks may run while a
+    // thread lock is held, so inspecting must not acquire those locks in reverse order.
+    stopWorkToken: Effect.fn("OrchestratorV2.stopWorkToken")((threadId) =>
+      readStopWorkToken(threadId),
+    ),
+    stopIfWorkUnchanged: Effect.fn("OrchestratorV2.stopIfWorkUnchanged")((input) =>
+      threadDispatch.withLock(
         input.threadId,
         Effect.gen(function* () {
-          const thread = yield* projectionStore
-            .getThread(input.threadId)
-            .pipe(
-              Effect.mapError(
-                (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
-              ),
-            );
-          // Stop or an explicit recovery choice can commit after the sweep reads its candidate.
-          if (
-            thread.limitRecovery?.runId === input.limitRecovery.runId &&
-            thread.limitRecovery.resetAt === input.limitRecovery.resetAt
-          )
-            return;
-          const command = { type: "thread.metadata.update", ...input } as const;
-          // A Stop that reached the run before its limit failure landed had nothing to disarm.
-          const stopped = yield* stopReachedRun(command, input.threadId, input.limitRecovery.runId);
-          yield* dispatchWithReceiptEffect(
-            stopped
-              ? {
-                  ...command,
-                  limitRecovery: { ...input.limitRecovery, autoResume: false, snooze: false },
-                }
-              : command,
+          const sequence = yield* stopSequence(input.threadId);
+          if ((yield* readStopWorkToken(input.threadId)) !== input.workToken)
+            return "changed" as const;
+          if (sequence !== (yield* stopSequence(input.threadId))) return "changed" as const;
+          return yield* dispatchWithReceiptEffect(
+            {
+              type: "thread.stop",
+              commandId: input.commandId,
+              threadId: input.threadId,
+              // Each local child needs its own consent; linked environments must not be stopped.
+              stopDelegatedTasks: false,
+            },
+            [],
+            undefined,
+            sequence,
+            true,
+          ).pipe(
+            Effect.as("stopped" as const),
+            Effect.catchIf(
+              (error) =>
+                error._tag === "OrchestratorDispatchError" &&
+                isEventSinkWriteError(error.cause) &&
+                isCommandSequenceChanged(error.cause.cause),
+              () => Effect.succeed("changed" as const),
+            ),
           );
         }),
+      ),
+    ),
+    autoArmLimitRecovery: Effect.fn("OrchestratorV2.autoArmLimitRecovery")(function (input) {
+      return threadDispatch.awaitStartAdmission(
+        threadDispatch.withLock(
+          input.threadId,
+          Effect.gen(function* () {
+            const thread = yield* projectionStore
+              .getThread(input.threadId)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new OrchestratorProjectionError({ threadId: input.threadId, cause }),
+                ),
+              );
+            // Stop or an explicit recovery choice can commit after the sweep reads its candidate.
+            if (
+              thread.limitRecovery?.runId === input.limitRecovery.runId &&
+              thread.limitRecovery.resetAt === input.limitRecovery.resetAt
+            )
+              return;
+            const command = { type: "thread.metadata.update", ...input } as const;
+            // A Stop that reached the run before its limit failure landed had nothing to disarm.
+            const stopped = yield* stopReachedRun(
+              command,
+              input.threadId,
+              input.limitRecovery.runId,
+            );
+            yield* dispatchWithReceiptEffect(
+              stopped
+                ? {
+                    ...command,
+                    limitRecovery: { ...input.limitRecovery, autoResume: false, snooze: false },
+                  }
+                : command,
+            );
+          }),
+        ),
       );
     }),
     searchThreadStream: (input) =>

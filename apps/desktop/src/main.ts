@@ -50,6 +50,7 @@ import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
 import * as DesktopManagedPolicy from "./app/DesktopManagedPolicy.ts";
 import * as DesktopLifecycle from "./app/DesktopLifecycle.ts";
+import * as DesktopSafeShutdown from "./app/DesktopSafeShutdown.ts";
 import * as DesktopLinuxUrlHandler from "./app/DesktopLinuxUrlHandler.ts";
 import * as DesktopShutdown from "./app/DesktopShutdown.ts";
 import * as DesktopObservability from "./app/DesktopObservability.ts";
@@ -208,6 +209,11 @@ const layerDesktopLocalEnvironmentAuth = DesktopLocalEnvironmentAuth.layer.pipe(
   Layer.provideMerge(layerDesktopBackend),
 );
 
+const layerDesktopSafeShutdown = DesktopSafeShutdown.layer.pipe(
+  Layer.provideMerge(layerDesktopLocalEnvironmentAuth),
+  Layer.provideMerge(layerDesktopSsh),
+);
+
 const layerDesktopApplication = Layer.mergeAll(
   DesktopLifecycle.layer,
   layerDesktopAppActivation,
@@ -228,6 +234,7 @@ const layerDesktopApplication = Layer.mergeAll(
   Layer.provideMerge(layerDesktopSsh),
   Layer.provideMerge(layerDesktopWslBackend),
   Layer.provideMerge(layerDesktopLocalEnvironmentAuth),
+  Layer.provideMerge(layerDesktopSafeShutdown),
 );
 
 // Clerk resolves userData before Electron is ready, so it gets the synchronous FileSystem.

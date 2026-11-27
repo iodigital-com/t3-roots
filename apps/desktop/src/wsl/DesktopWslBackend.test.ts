@@ -8,6 +8,7 @@ import * as NetService from "@t3tools/shared/Net";
 
 import * as DesktopBackendConfiguration from "../backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "../backend/DesktopBackendPool.ts";
+import * as DesktopQuitAdmission from "../app/DesktopQuitAdmission.ts";
 import type {
   DesktopBackendSnapshot,
   DesktopBackendStartConfig,
@@ -83,6 +84,33 @@ const layerNet = Layer.succeed(NetService.NetService, {
   findAvailablePort: (preferred) => Effect.succeed(preferred),
 } satisfies NetService.NetService["Service"]);
 
+function makePoolLayer(
+  primary: DesktopBackendPool.DesktopBackendInstance,
+  getList: () => readonly DesktopBackendPool.DesktopBackendInstance[],
+  register: DesktopBackendPool.DesktopBackendPool["Service"]["register"],
+  unregister: DesktopBackendPool.DesktopBackendPool["Service"]["unregister"],
+): Layer.Layer<DesktopBackendPool.DesktopBackendPool> {
+  return Layer.effect(
+    DesktopBackendPool.DesktopBackendPool,
+    Effect.gen(function* () {
+      const quitAdmission = yield* DesktopQuitAdmission.make;
+      return {
+        get: (id: DesktopBackendPool.BackendInstanceId) =>
+          Effect.succeed(
+            id === DesktopBackendPool.PRIMARY_INSTANCE_ID
+              ? Option.some(primary)
+              : Option.none<DesktopBackendPool.DesktopBackendInstance>(),
+          ),
+        list: Effect.sync(getList),
+        primary: Effect.succeed(primary),
+        quitAdmission,
+        register,
+        unregister,
+      } satisfies DesktopBackendPool.DesktopBackendPool["Service"];
+    }),
+  );
+}
+
 describe("DesktopWslBackend", () => {
   it.effect("clears the stored preflight error when a registered WSL backend becomes ready", () => {
     let registeredSpec: DesktopBackendPool.BackendInstanceSpec | undefined;
@@ -93,16 +121,10 @@ describe("DesktopWslBackend", () => {
       label: "Windows",
       snapshot: primarySnapshot,
     });
-    const layerPool = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
-      get: (id) =>
-        Effect.succeed(
-          id === DesktopBackendPool.PRIMARY_INSTANCE_ID
-            ? Option.some(primary)
-            : Option.none<DesktopBackendPool.DesktopBackendInstance>(),
-        ),
-      list: Effect.sync(() => (registeredWsl === undefined ? [primary] : [primary, registeredWsl])),
-      primary: Effect.succeed(primary),
-      register: (spec) =>
+    const layerPool = makePoolLayer(
+      primary,
+      () => (registeredWsl === undefined ? [primary] : [primary, registeredWsl]),
+      (spec) =>
         Effect.sync(() => {
           registeredSpec = spec;
           registeredWsl = makeStubInstance({
@@ -115,11 +137,11 @@ describe("DesktopWslBackend", () => {
           });
           return registeredWsl;
         }),
-      unregister: () =>
+      () =>
         Effect.sync(() => {
           registeredWsl = undefined;
         }),
-    } satisfies DesktopBackendPool.DesktopBackendPool["Service"]);
+    );
 
     return Effect.gen(function* () {
       const backend = yield* DesktopWslBackend.DesktopWslBackend;

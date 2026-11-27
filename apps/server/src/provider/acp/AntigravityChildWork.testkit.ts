@@ -26,6 +26,11 @@ const field = (number: number, value: string | Uint8Array) => {
 };
 const proto = (...parts: number[][]) => Uint8Array.from(parts.flat());
 const toolCall = (id: string) => proto(field(1, id), field(2, "invoke_subagent"));
+export const backgroundStep = (id: string, name: string, taskId: string) =>
+  proto(
+    field(5, proto(field(4, proto(field(1, id), field(2, name))))),
+    field(148, proto(field(1, taskId))),
+  );
 
 export const invokeStep = (input: {
   readonly callId: string;
@@ -49,6 +54,26 @@ export const invokeStep = (input: {
   );
 export const plannerStep = (callIds: ReadonlyArray<string>) =>
   proto(field(20, proto(...callIds.map((id) => field(7, toolCall(id))))));
+export const plannerReplyStep = (status: number, reply = "", hasToolCalls = false) =>
+  proto(
+    [...varint(4 * 8), ...varint(status)],
+    field(
+      20,
+      proto(field(1, reply), ...(hasToolCalls ? [field(7, toolCall("another-call"))] : [])),
+    ),
+  );
+
+export const putStep = (file: string, idx: number, type: number, payload: Uint8Array) =>
+  Effect.sync(() => {
+    const db = new NodeSqlite.DatabaseSync(file);
+    try {
+      db.prepare(
+        "INSERT OR REPLACE INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)",
+      ).run(idx, type, payload);
+    } finally {
+      db.close();
+    }
+  });
 
 export const transcriptLines = [
   // Trimmed from 1.4.5: the launch envelope around the prompt the parent record already holds.
@@ -72,6 +97,7 @@ export const transcriptLines = [
 export const makeProfile = Effect.fn("makeProfile")(function* (input: {
   /** Defaults to a scoped temp directory. */
   readonly profile?: string;
+  readonly rootSessionId?: string;
   readonly steps: (logUri: string) => ReadonlyArray<readonly [number, number, Uint8Array]>;
   readonly transcript?: string;
 }) {
@@ -88,7 +114,8 @@ export const makeProfile = Effect.fn("makeProfile")(function* (input: {
     input.transcript ?? transcriptLines.map((line) => JSON.stringify(line)).join("\n") + "\n",
   );
   const logUri = NodeURL.pathToFileURL(transcriptPath).href;
-  const database = new NodeSqlite.DatabaseSync(path.join(acp, "conversations", `${ROOT}.db`));
+  const databasePath = path.join(acp, "conversations", `${input.rootSessionId ?? ROOT}.db`);
+  const database = new NodeSqlite.DatabaseSync(databasePath);
   database.exec(
     "CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, step_format integer NOT NULL DEFAULT 0, step_payload blob)",
   );
@@ -97,7 +124,7 @@ export const makeProfile = Effect.fn("makeProfile")(function* (input: {
   );
   for (const [idx, type, payload] of input.steps(logUri)) insert.run(idx, type, payload);
   database.close();
-  return { profile, transcriptPath, logUri };
+  return { profile, transcriptPath, logUri, databasePath };
 });
 
 export const autoApproved = (logUri: string) =>

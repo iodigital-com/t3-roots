@@ -107,3 +107,82 @@ it.effect("rejects a planned fork whose source was deleted before it committed",
     assert.instanceOf(missing, ProjectionStore.ProjectionStoreThreadNotFoundError);
   }).pipe(Effect.provide(layer)),
 );
+
+it.effect("does not commit a conditional command after a provider event", () =>
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("conditional-event-thread");
+    const now = yield* DateTime.now;
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const thread: OrchestrationV2AppThread = {
+      id: threadId,
+      projectId: ProjectId.make("project"),
+      title: "Before",
+      createdBy: "user",
+      creationSource: "web",
+      providerInstanceId,
+      modelSelection: { instanceId: providerInstanceId, model: "gpt-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      activeProviderThreadId: null,
+      lineage: { rootThreadId: threadId, parentThreadId: null, relationshipToParent: null },
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      archivedAt: null,
+      deletedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      snoozedUntil: null,
+      snoozedAt: null,
+      lastVisitedAt: null,
+    };
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("conditional-created"),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: thread,
+        },
+      ],
+    });
+    const expectedSequence = yield* sink.latestSequence({ threadId });
+    yield* sink.write({
+      events: [
+        {
+          id: EventId.make("provider-change"),
+          type: "thread.metadata-updated",
+          threadId,
+          occurredAt: now,
+          payload: { ...thread, title: "Provider change" },
+        },
+      ],
+    });
+    const rejected = yield* sink
+      .commitCommand({
+        commandId: CommandId.make("stale-conditional-command"),
+        commandType: "thread.stop",
+        threadId,
+        acceptedAt: now,
+        expectedSequence,
+        events: [
+          {
+            id: EventId.make("stale-command-event"),
+            type: "thread.metadata-updated",
+            threadId,
+            occurredAt: now,
+            payload: { ...thread, title: "Stale plan" },
+          },
+        ],
+        effects: [],
+      })
+      .pipe(Effect.flip);
+    assert.instanceOf(rejected.cause, EventSink.CommandSequenceChanged);
+    assert.equal((yield* projections.getThread(threadId)).title, "Provider change");
+  }).pipe(Effect.provide(layer)),
+);

@@ -27,6 +27,7 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 
 const threadId = ThreadId.make("thread-provider-continuation");
 const providerThreadId = ProviderThreadId.make("provider-thread-continuation");
@@ -97,7 +98,9 @@ function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
   readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
   readonly beforeDispatch?: (threadId: ThreadId) => Effect.Effect<void>;
+  readonly requestsLayer?: typeof ProviderContinuationRequests.layer;
 }) {
+  const requestsLayer = input.requestsLayer ?? ProviderContinuationRequests.layer;
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
     getThreadRecords: input.getThreadRecords,
     dispatch: (command) =>
@@ -107,14 +110,55 @@ function layerTest(input: {
       ).pipe(Effect.andThen(Queue.offer(input.dispatched, command)), Effect.as({} as never)),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
-    Layer.provide(
-      Layer.mergeAll(IdAllocator.layer, ProviderContinuationRequests.layer, layerThreads),
-    ),
+    Layer.provide(Layer.mergeAll(IdAllocator.layer, requestsLayer, layerThreads)),
   );
-  return Layer.merge(ProviderContinuationRequests.layer, layerWorker);
+  return Layer.merge(requestsLayer, layerWorker);
 }
 
 describe("ProviderContinuationService", () => {
+  it.effect("a paused admission holds a background continuation until release", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Queue.unbounded<unknown>();
+      const pending =
+        yield* Queue.unbounded<ProviderContinuationRequests.ProviderContinuationRequest>();
+      const waitingForNext = yield* Deferred.make<void>();
+      let takes = 0;
+      const requestsLayer = Layer.succeed(
+        ProviderContinuationRequests.ProviderContinuationRequests,
+        {
+          offer: (item) => Queue.offer(pending, item).pipe(Effect.asVoid),
+          take: Effect.suspend(() =>
+            ++takes === 2
+              ? Deferred.succeed(waitingForNext, undefined).pipe(
+                  Effect.andThen(Queue.take(pending)),
+                )
+              : Queue.take(pending),
+          ),
+        },
+      );
+      yield* Effect.gen(function* () {
+        const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const requests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+        assert.isTrue(yield* executor.acquireStartBarrier("lease", Effect.succeed(true)));
+        yield* requests.offer(request(undefined, "background wake"));
+        yield* Deferred.await(waitingForNext);
+        assert.strictEqual(yield* Queue.size(dispatched), 0);
+        assert.isTrue(yield* executor.releaseStartBarrier("lease"));
+        const command = yield* Queue.take(dispatched);
+        assert.equal((command as { type: string }).type, "message.dispatch");
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            dispatched,
+            requestsLayer,
+            getThreadRecords: () => Effect.succeed(projection),
+          }).pipe(Layer.provideMerge(ThreadCommandExecutor.layer)),
+        ),
+        Effect.scoped,
+      );
+    }),
+  );
+
   it.effect("recovers an unaccepted persisted steer using the same delivery identity", () =>
     Effect.gen(function* () {
       const dispatched = yield* Queue.unbounded<unknown>();

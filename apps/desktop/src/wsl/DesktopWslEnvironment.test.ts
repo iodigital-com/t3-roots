@@ -14,6 +14,7 @@ import { afterAll, expect } from "vite-plus/test";
 import * as NodeChildProcess from "node:child_process";
 
 import { ManagedPolicyFileError } from "@t3tools/shared/managedPolicyFile";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopManagedPolicy from "../app/DesktopManagedPolicy.ts";
@@ -27,6 +28,7 @@ import {
   buildWslRuntimeProbeScript,
   parseResolvedPath,
   parseWslRuntimeRoot,
+  processExitedImpl,
   windowsToWslPathImpl,
 } from "./DesktopWslEnvironment.ts";
 
@@ -37,10 +39,10 @@ import {
 const REQUIRED_SHELL_TOOLS = ["flock", "sha256sum", "tar", "mktemp"] as const;
 
 const posixShellRunner = (() => {
-  const candidates = [
-    { file: "bash", args: [] as ReadonlyArray<string> },
-    { file: "wsl.exe", args: ["-e", "bash"] as ReadonlyArray<string> },
-  ];
+  const candidates =
+    HostProcess.Platform.defaultValue() === "win32"
+      ? [{ file: "wsl.exe", args: ["-e", "bash"] as ReadonlyArray<string> }]
+      : [{ file: "bash", args: [] as ReadonlyArray<string> }];
   const probe = [
     "[ -d /proc/1 ] || exit 1",
     ...REQUIRED_SHELL_TOOLS.map((tool) => `command -v ${tool} >/dev/null || exit 1`),
@@ -601,3 +603,51 @@ describe("windowsToWslPathImpl", () => {
     }),
   );
 });
+
+it.effect("only confirms a WSL process exit when its distro can verify proc", () =>
+  Effect.gen(function* () {
+    let exitCode = 0;
+    const spawned: Array<ChildProcess.Command> = [];
+    const spawner = ChildProcessSpawner.make((command) => {
+      spawned.push(command);
+      return Effect.succeed(
+        ChildProcessSpawner.makeHandle({
+          pid: ChildProcessSpawner.ProcessId(1),
+          stdout: Stream.empty,
+          stderr: Stream.empty,
+          all: Stream.empty,
+          exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(exitCode)),
+          isRunning: Effect.succeed(false),
+          kill: () => Effect.void,
+          stdin: Sink.drain,
+          getInputFd: () => Sink.drain,
+          getOutputFd: () => Stream.empty,
+          unref: Effect.succeed(Effect.void),
+        }),
+      );
+    });
+    const probe = (pid: number) =>
+      processExitedImpl("Ubuntu", pid).pipe(
+        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+      );
+    assert.isTrue(yield* probe(123));
+    const command = spawned[0];
+    assert(command?._tag === "StandardCommand");
+    assert.deepStrictEqual(command.args, [
+      "-d",
+      "Ubuntu",
+      "--exec",
+      "test",
+      "-d",
+      "/proc/1",
+      "-a",
+      "!",
+      "-d",
+      "/proc/123",
+    ]);
+    exitCode = 1;
+    assert.isFalse(yield* probe(123));
+    assert.isFalse(yield* probe(-1));
+    assert.lengthOf(spawned, 2);
+  }),
+);

@@ -2,6 +2,7 @@ import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwarene
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
 import { projectTurnItemForWire } from "./WireProjection.ts";
+import { START_EFFECT_TYPES } from "./EffectOutbox.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -187,6 +188,7 @@ export type ProjectionStoreV2Error = typeof ProjectionStoreV2Error.Type;
 
 export type ProjectionRecoveryKind =
   | "queued-runs"
+  | "safe-shutdown"
   | "runtime"
   | "restart-continuations"
   | "subagent-results"
@@ -5068,6 +5070,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       ) {
         const candidates = (() => {
           switch (kind) {
+            case "safe-shutdown":
+              // Shells hide idle-compaction runs, but quit still interrupts them.
+              return sql`
+                SELECT thread_id FROM orchestration_v2_projection_runs
+                WHERE status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+                  AND NOT (status = 'queued' AND json_extract(payload_json, '$.queueHeld') IS 1)
+                UNION
+                SELECT thread_id FROM orchestration_v2_effect_outbox
+                WHERE status IN ('pending', 'running')
+                  AND effect_type IN ${sql.in(START_EFFECT_TYPES)}
+              `;
             case "queued-runs":
               return sql`
                 SELECT thread_id FROM orchestration_v2_projection_runs

@@ -116,6 +116,14 @@ describe("resolveDisplayedThreadPr", () => {
       expect(resolveDisplayedThreadPrProvider(input)).toEqual(
         state === "open" ? provider : undefined,
       );
+      const movedThread = { ...input, threadBranch: "feature/old", followCheckout: true };
+      expect(resolveDisplayedThreadPr(movedThread)).toEqual(state === "open" ? branchPr : null);
+      expect(resolveDisplayedThreadPrProvider(movedThread)).toEqual(
+        state === "open" ? provider : undefined,
+      );
+      expect(
+        resolveDisplayedThreadPr({ ...movedThread, gitStatus: status({ pr: null }) }),
+      ).toBeNull();
     },
   );
 

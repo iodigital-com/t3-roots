@@ -294,12 +294,19 @@ export const extractAntigravityElicitationForm: NonNullable<
 };
 
 /**
- * The agent goes on running a command after its prompt ends, and replies by itself when the
- * command finishes. A daemon may never finish.
+ * Commands and one-shot schedules can wake the agent after its prompt ends. Daemons may not end.
  */
-export function antigravityCommandOutlivesPrompt(toolCall: AcpToolCallState): boolean {
+export function antigravityToolOutlivesPrompt(toolCall: AcpToolCallState): boolean {
   const input = toolCall.data.rawInput;
-  return toolCall.kind === "execute" && !(Predicate.isObject(input) && input.IsDaemon === true);
+  if (toolCall.kind === "execute") return !(Predicate.isObject(input) && input.IsDaemon === true);
+  return (
+    toolCall.kind === "other" &&
+    toolCall.title === "Run schedule" &&
+    Predicate.isObject(input) &&
+    typeof input.DurationSeconds === "number" &&
+    input.DurationSeconds > 0 &&
+    input.IsDaemon !== true
+  );
 }
 
 /** Native questions share the permission method, but their choices are not approvals. */

@@ -108,6 +108,7 @@ import {
   ThreadWorktreeIndicator,
   prStatusIndicator,
   resolveThreadPullRequestBadge,
+  resolveDisplayedThreadPr,
   terminalStatusFromRunningIds,
   type TerminalStatusIndicator,
   useLinkedThreadPullRequest,
@@ -739,10 +740,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     thread.linkedPullRequest,
     leaseLiveStatus,
     thread.pullRequests,
-    thread.branchPullRequest,
+    gitCwd === null ? thread.branchPullRequest : undefined,
   );
   const branchTarget =
-    leaseLiveStatus && (thread.branch != null || thread.worktreePath !== null) && gitCwd !== null
+    leaseLiveStatus && gitCwd !== null
       ? { environmentId: thread.environmentId, cwd: gitCwd }
       : null;
   const gitStatus = useEnvironmentQuery(
@@ -754,12 +755,28 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
         }),
   );
   useAtomMount(vcsBranchRevalidation(branchTarget));
+  const prGitStatus = useEnvironmentQuery(
+    branchTarget === null
+      ? null
+      : vcsEnvironment.status({
+          environmentId: branchTarget.environmentId,
+          input: { cwd: branchTarget.cwd },
+        }),
+  );
   const visibleGitStatus = useRetainedValue(
     JSON.stringify([thread.environmentId, gitCwd]),
     gitStatus.data,
   );
   const checkoutThread = withoutRemovedCheckout(thread, visibleGitStatus);
-  const pr = linkedPullRequestStatus?.pr ?? null;
+  const visiblePrGitStatus = useRetainedValue(
+    JSON.stringify([thread.environmentId, gitCwd]),
+    prGitStatus.data,
+  );
+  const branchPr = resolveDisplayedThreadPr({
+    threadBranch: visibleGitStatus?.refName ?? null,
+    gitStatus: visiblePrGitStatus,
+  });
+  const pr = branchPr ?? linkedPullRequestStatus?.pr ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
   const currentLinkedPr = supportsMultiplePullRequests
     ? resolveThreadCurrentPullRequestLink(thread.pullRequests)
@@ -849,7 +866,13 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
     activeThreadBranch: thread.branch,
     currentGitBranch: visibleGitStatus?.refName ?? null,
   });
-  const prStatus = prStatusIndicator(pr, linkedPullRequestStatus?.sourceControlProvider, messages);
+  const prStatus = prStatusIndicator(
+    pr,
+    branchPr
+      ? visiblePrGitStatus?.sourceControlProvider
+      : linkedPullRequestStatus?.sourceControlProvider,
+    messages,
+  );
 
   const modelInstanceId = thread.runtime?.providerInstanceId ?? thread.modelSelection.instanceId;
   const providerEntry = props.providerEntryByInstanceId.get(modelInstanceId) ?? null;
@@ -997,10 +1020,14 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
   if (snoozeMenuOpenRaw && !showSnoozeButton) setSnoozeMenuOpen(false);
   const snoozeMenuOpen = snoozeMenuOpenRaw && showSnoozeButton;
   const jumpHintLabel = snoozeMenuOpen ? null : props.jumpLabel;
-  const handlePrClick = (event: ReactMouseEvent<HTMLElement>, targetUrl?: string) => {
+  const handlePrClick = (
+    event: ReactMouseEvent<HTMLElement>,
+    targetUrl?: string,
+    fromList = false,
+  ) => {
     const url = targetUrl ?? pr?.url ?? currentLinkedPr?.url;
     if (!url) return;
-    const showInRightPanel = targetUrl !== undefined || readOpensPullRequestsInRightPanel();
+    const showInRightPanel = fromList || readOpensPullRequestsInRightPanel();
     const openedInRightPanel = openPrLink(event, url, showInRightPanel ? threadRef : undefined);
     if (openedInRightPanel && showInRightPanel && !props.isRouteThread) {
       onThreadActivate(threadRef);

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
+  AuthSessionId,
   ContextTransferId,
   EventId,
   MessageId,
@@ -18,6 +19,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -25,6 +27,7 @@ import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
 import * as Stream from "effect/Stream";
 import * as EventStore from "./EventStore.ts";
 import * as TestClock from "effect/testing/TestClock";
@@ -42,6 +45,13 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "./ProviderAdapterRegistry.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as SafeShutdownService from "./SafeShutdownService.ts";
+import * as SafeShutdownHttp from "./SafeShutdownHttp.ts";
+import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as ServerConfig from "../config.ts";
+import * as TerminalManager from "../terminal/Manager.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
@@ -72,6 +82,14 @@ const layerTest = ThreadManagementService.layer.pipe(
   ),
   Layer.provideMerge(ServerSettings.layerTest()),
   Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+);
+const layerShutdownTest = SafeShutdownService.layer.pipe(
+  Layer.provideMerge(layerTest),
+  Layer.provide(Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) })),
+  Layer.provideMerge(ThreadCommandExecutor.layer),
+  Layer.provide(
+    Layer.mock(TerminalManager.TerminalManager)({ hasTerminalProcesses: Effect.succeed(false) }),
+  ),
 );
 
 const encodeEffectRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
@@ -890,6 +908,676 @@ it.effect(
         "queued:held",
       ]);
     }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a conditional Stop refuses a replacement run", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:conditional-stop-replacement");
+    yield* createWatchingThread(threadId, 32);
+    yield* send(threadId, "old", "start_immediately");
+    const workToken = yield* orchestrator.stopWorkToken(threadId);
+    const old = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const now = yield* DateTime.now;
+    yield* projections.apply({
+      id: EventId.make("event:conditional-stop:old-completed"),
+      type: "run.updated",
+      threadId,
+      runId: old.id,
+      occurredAt: now,
+      payload: { ...old, status: "completed", completedAt: now },
+    });
+    yield* send(threadId, "replacement", "start_immediately");
+
+    const result = yield* orchestrator.stopIfWorkUnchanged({
+      commandId: CommandId.make("stop:conditional-replacement"),
+      threadId,
+      workToken,
+    });
+    assert.equal(result, "changed");
+    assert.deepEqual(yield* threadState(threadId), {
+      runs: ["completed", "starting"],
+      watched: [32],
+    });
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a shutdown snapshot binds consent to work and leaves its queue held", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const threadId = ThreadId.make("thread:shutdown-snapshot");
+    yield* createWatchingThread(threadId, 37);
+    yield* send(threadId, "active", "start_immediately");
+    yield* send(threadId, "queued", "queue_after_active");
+    const snapshot = yield* shutdown.snapshot;
+    assert.deepEqual(
+      snapshot.threads.map((thread) => thread.id),
+      [threadId],
+    );
+    assert.isTrue(yield* shutdown.acquire("lease", snapshot.snapshotToken));
+    yield* send(threadId, "not confirmed", "queue_after_active").pipe(Effect.flip);
+    assert.equal(
+      yield* shutdown.stop("lease", threadId, snapshot.threads[0]!.workToken),
+      "stopped",
+    );
+    assert.equal(yield* shutdown.status("lease"), "ready");
+    assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted", "queued:held"]);
+    assert.isTrue(yield* shutdown.release("lease"));
+    yield* orchestrator.resumeQueuedRuns;
+    assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted", "queued:held"]);
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("the authenticated backend protocol holds stopped work through exit", () =>
+  Effect.gen(function* () {
+    let exitRequested = false;
+    const service = SafeShutdownService.layerWithExit(
+      Effect.sync(() => {
+        exitRequested = true;
+      }),
+    ).pipe(
+      Layer.provideMerge(layerTest),
+      Layer.provide(
+        Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
+      ),
+      Layer.provideMerge(ThreadCommandExecutor.layer),
+      Layer.provide(
+        Layer.mock(TerminalManager.TerminalManager)({
+          hasTerminalProcesses: Effect.succeed(false),
+        }),
+      ),
+    );
+    const auth = Layer.mock(EnvironmentAuth.EnvironmentAuth)({
+      authenticateHttpRequest: () =>
+        Effect.succeed({
+          sessionId: AuthSessionId.make("session:desktop"),
+          subject: "desktop-bootstrap",
+          method: "bearer-access-token",
+          scopes: ["orchestration:operate"],
+        }),
+    });
+    yield* Effect.gen(function* () {
+      const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+      const threadId = ThreadId.make("thread:shutdown-http");
+      yield* createWatchingThread(threadId, 48);
+      yield* send(threadId, "active", "start_immediately");
+      yield* send(threadId, "queued", "queue_after_active");
+      const call = (command: unknown) =>
+        Effect.gen(function* () {
+          const request = HttpServerRequest.fromWeb(
+            new Request("http://localhost/api/orchestration/desktop-safe-shutdown", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(command),
+            }),
+          );
+          const response = HttpServerResponse.toWeb(
+            yield* SafeShutdownHttp.handler.pipe(
+              Effect.provideService(HttpServerRequest.HttpServerRequest, request),
+            ),
+          );
+          assert.equal(response.status, 200);
+          return yield* Effect.promise(() => response.json());
+        });
+      const snapshot = (yield* call({ type: "snapshot" })) as {
+        snapshotToken: string;
+        threads: Array<{ id: string; workToken: string }>;
+      };
+      assert.deepEqual(
+        snapshot.threads.map((thread) => thread.id),
+        [threadId],
+      );
+      assert.deepEqual(
+        yield* call({ type: "acquire", leaseId: "lease", snapshotToken: snapshot.snapshotToken }),
+        { type: "acquire", acquired: true },
+      );
+      assert.deepEqual(
+        yield* call({
+          type: "stop",
+          leaseId: "lease",
+          threadId,
+          workToken: snapshot.threads[0]!.workToken,
+        }),
+        { type: "stop", status: "stopped" },
+      );
+      assert.deepEqual(yield* call({ type: "status", leaseId: "lease" }), {
+        type: "status",
+        status: "ready",
+      });
+      assert.deepEqual(yield* call({ type: "seal", leaseId: "lease" }), {
+        type: "seal",
+        sealed: true,
+      });
+      assert.deepEqual(yield* call({ type: "backend-exit", leaseId: "lease" }), {
+        type: "backend-exit",
+        accepted: true,
+      });
+      assert.isTrue(exitRequested);
+      yield* TestClock.adjust("60 seconds");
+      assert.equal(
+        (yield* Effect.flip(commands.withStartAdmission(Effect.void)))._tag,
+        "StartAdmissionBlocked",
+      );
+      assert.deepEqual(yield* call({ type: "release", leaseId: "lease" }), {
+        type: "release",
+        released: false,
+      });
+      assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted", "queued:held"]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          service,
+          auth,
+          Layer.succeed(ServerConfig.ServerConfig, {
+            mode: "desktop",
+          } as ServerConfig.ServerConfig["Service"]),
+        ),
+      ),
+    );
+  }),
+);
+
+it.effect("shutdown waits for the confirmed stop's provider interrupt to finish", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const threadId = ThreadId.make("thread:shutdown-interrupt-pending");
+    yield* createWatchingThread(threadId, 45);
+    const snapshot = yield* shutdown.snapshot;
+    assert.isTrue(yield* shutdown.acquire("lease", snapshot.snapshotToken));
+    assert.equal(
+      yield* shutdown.stop("lease", threadId, snapshot.threads[0]!.workToken),
+      "stopped",
+    );
+    yield* outbox.enqueue([
+      {
+        id: "effect:shutdown-interrupt-pending",
+        commandId: CommandId.make(`command:safe-shutdown:lease:${threadId}`),
+        threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          providerSessionId: ProviderSessionId.make("session:shutdown-interrupt-pending"),
+          providerThreadId: ProviderThreadId.make("provider-thread:shutdown-interrupt-pending"),
+          providerTurnId: ProviderTurnId.make("provider-turn:shutdown-interrupt-pending"),
+        },
+      },
+    ]);
+    assert.equal(yield* shutdown.status("lease"), "quiescing");
+    yield* outbox.claimNext({ workerId: "shutdown-test" });
+    assert.isTrue(
+      yield* outbox.succeed({
+        effectId: "effect:shutdown-interrupt-pending",
+        workerId: "shutdown-test",
+      }),
+    );
+    assert.equal(yield* shutdown.status("lease"), "ready");
+    yield* outbox.enqueue([
+      {
+        id: "effect:shutdown-interrupt-failed",
+        commandId: CommandId.make(`command:safe-shutdown:lease:${threadId}`),
+        threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          providerSessionId: ProviderSessionId.make("session:shutdown-interrupt-failed"),
+          providerThreadId: ProviderThreadId.make("provider-thread:shutdown-interrupt-failed"),
+          providerTurnId: ProviderTurnId.make("provider-turn:shutdown-interrupt-failed"),
+        },
+      },
+    ]);
+    yield* outbox.claimNext({ workerId: "shutdown-test" });
+    assert.isTrue(
+      yield* outbox.fail({
+        effectId: "effect:shutdown-interrupt-failed",
+        workerId: "shutdown-test",
+        error: "interrupt failed",
+      }),
+    );
+    assert.equal(yield* shutdown.status("lease"), "quiescing");
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("an abandoned shutdown releases admission but keeps stopped queues held", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:shutdown-abandoned");
+    yield* createWatchingThread(threadId, 46);
+    yield* send(threadId, "active", "start_immediately");
+    yield* send(threadId, "queued", "queue_after_active");
+    const snapshot = yield* shutdown.snapshot;
+    assert.isTrue(yield* shutdown.acquire("abandoned", snapshot.snapshotToken));
+    assert.equal(
+      yield* shutdown.stop("abandoned", threadId, snapshot.threads[0]!.workToken),
+      "stopped",
+    );
+    yield* TestClock.adjust("31 seconds");
+    yield* commands.withStartAdmission(Effect.void);
+    yield* orchestrator.resumeQueuedRuns;
+    assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted", "queued:held"]);
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("a confirmed Stop cancels a claimed paused start so its interrupt can run", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const outbox = yield* EffectOutbox.EffectOutboxV2;
+    const claimed = yield* Deferred.make<void>();
+    const interrupted = yield* Deferred.make<void>();
+    const threadId = ThreadId.make("thread:shutdown-claimed-start");
+    yield* createWatchingThread(threadId, 44);
+    yield* send(threadId, "active", "start_immediately");
+    const snapshot = yield* shutdown.snapshot;
+    assert.isTrue(yield* shutdown.acquire("lease", snapshot.snapshotToken));
+    const layerExecutor = Layer.succeed(EffectWorker.OrchestrationEffectExecutorV2, {
+      execute: (effect) =>
+        effect.request.type === "provider-turn.interrupt"
+          ? Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid)
+          : Deferred.succeed(claimed, undefined).pipe(
+              Effect.andThen(commands.awaitStartAdmission(Effect.die("stopped start ran"))),
+            ),
+    });
+    const worker = yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions({ workerId: "shutdown-test" }).pipe(
+          Layer.provide(layerExecutor),
+          Layer.provide(Layer.succeed(EffectOutbox.EffectOutboxV2, outbox)),
+        ),
+      ),
+    );
+    const running = yield* worker.runOnce().pipe(Effect.forkChild({ startImmediately: true }));
+    yield* Deferred.await(claimed);
+    assert.equal(
+      yield* shutdown.stop("lease", threadId, snapshot.threads[0]!.workToken),
+      "stopped",
+    );
+    yield* Fiber.join(running);
+    yield* outbox.enqueue([
+      {
+        id: "effect:shutdown-interrupt",
+        commandId: CommandId.make("command:shutdown-interrupt"),
+        threadId,
+        request: {
+          type: "provider-turn.interrupt",
+          providerSessionId: ProviderSessionId.make("session:shutdown-interrupt"),
+          providerThreadId: ProviderThreadId.make("provider-thread:shutdown-interrupt"),
+          providerTurnId: ProviderTurnId.make("provider-turn:shutdown-interrupt"),
+        },
+      },
+    ]);
+    assert.isTrue(yield* worker.runOnce());
+    assert.isTrue(yield* Deferred.isDone(interrupted));
+    assert.isTrue(yield* shutdown.release("lease"));
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("a shutdown acquisition refuses work that appeared after inspection", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const threadId = ThreadId.make("thread:shutdown-changed");
+    yield* createWatchingThread(threadId, 38);
+    yield* send(threadId, "active", "start_immediately");
+    const snapshot = yield* shutdown.snapshot;
+    yield* send(threadId, "new", "queue_after_active");
+    assert.isFalse(yield* shutdown.acquire("lease", snapshot.snapshotToken));
+    yield* send(threadId, "another", "queue_after_active");
+    assert.deepEqual((yield* threadState(threadId)).runs, ["starting", "queued", "queued"]);
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("shutdown inspection refuses while an embedded terminal process is alive", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const threadId = ThreadId.make("thread:shutdown-terminal");
+    yield* createWatchingThread(threadId, 47);
+    yield* send(threadId, "active", "start_immediately");
+    const failure = yield* Effect.flip(shutdown.snapshot);
+    assert.equal(failure._tag, "SafeShutdownTerminalBusy");
+    assert.deepEqual((yield* threadState(threadId)).runs, ["starting"]);
+  }).pipe(
+    Effect.provide(
+      SafeShutdownService.layer.pipe(
+        Layer.provideMerge(layerTest),
+        Layer.provide(
+          Layer.mock(ProjectStore.ProjectStoreV2)({ listShells: () => Effect.succeed([]) }),
+        ),
+        Layer.provideMerge(ThreadCommandExecutor.layer),
+        Layer.provide(
+          Layer.mock(TerminalManager.TerminalManager)({
+            hasTerminalProcesses: Effect.succeed(true),
+          }),
+        ),
+      ),
+    ),
+  ),
+);
+
+it.effect("the shutdown snapshot includes an archived running thread", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:shutdown-archived");
+    yield* createWatchingThread(threadId, 39);
+    yield* send(threadId, "active", "start_immediately");
+    yield* orchestrator.dispatch({
+      type: "thread.archive",
+      commandId: CommandId.make("archive:shutdown"),
+      threadId,
+    });
+    const snapshot = yield* shutdown.snapshot;
+    assert.deepEqual(
+      snapshot.threads.map((thread) => thread.id),
+      [threadId],
+    );
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("shutdown inspection includes silent compaction until its queue is held", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:shutdown-silent-compaction");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create:shutdown-compaction"),
+      threadId,
+      projectId: ProjectId.make("project:thread-stop"),
+      title: "Compacting",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    yield* send(threadId, "active", "start_immediately");
+    const initial = yield* orchestrator.getThreadProjection(threadId);
+    const run = initial.runs[0]!;
+    const message = initial.messages.find((candidate) => candidate.id === run.userMessageId)!;
+    const now = yield* DateTime.now;
+    yield* projections.apply({
+      id: EventId.make("event:shutdown-silent-message"),
+      type: "message.updated",
+      threadId,
+      occurredAt: now,
+      payload: { ...message, text: "/compact", createdBy: "agent", creationSource: "server" },
+    });
+    assert.isNull(
+      (yield* orchestrator.getShellSnapshot()).threads.find((thread) => thread.id === threadId)!
+        .activityRunStatus,
+    );
+    assert.deepEqual(
+      (yield* shutdown.snapshot).threads.map((thread) => thread.id),
+      [threadId],
+    );
+    yield* projections.apply({
+      id: EventId.make("event:shutdown-silent-queued"),
+      type: "run.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "queued", startedAt: null, queueHeld: false },
+    });
+    assert.deepEqual(
+      (yield* shutdown.snapshot).threads.map((thread) => thread.id),
+      [threadId],
+    );
+    yield* projections.apply({
+      id: EventId.make("event:shutdown-silent-held"),
+      type: "run.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "queued", startedAt: null, queueHeld: true },
+    });
+    yield* (yield* EffectOutbox.EffectOutboxV2).cancelUnsettled({
+      threadId,
+      effectTypes: EffectOutbox.START_EFFECT_TYPES,
+      reason: "The held run has no pending start.",
+    });
+    assert.isEmpty((yield* shutdown.snapshot).threads);
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("a shutdown token cannot stop a different thread", () =>
+  Effect.gen(function* () {
+    const shutdown = yield* SafeShutdownService.SafeShutdownService;
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const first = ThreadId.make("thread:shutdown-consented");
+    const other = ThreadId.make("thread:shutdown-other");
+    yield* createWatchingThread(first, 40);
+    yield* send(first, "active", "start_immediately");
+    yield* orchestrator.dispatch({
+      type: "thread.create",
+      commandId: CommandId.make("create:shutdown-other"),
+      threadId: other,
+      projectId: ProjectId.make("project:thread-stop"),
+      title: "Other",
+      modelSelection,
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      createdBy: "user",
+      creationSource: "web",
+    });
+    const snapshot = yield* shutdown.snapshot;
+    assert.deepEqual(
+      snapshot.threads.map((thread) => thread.id),
+      [first],
+    );
+    assert.isTrue(yield* shutdown.acquire("lease", snapshot.snapshotToken));
+    const before = yield* orchestrator.getThreadEventSequence(other);
+    assert.equal(yield* shutdown.stop("lease", other, snapshot.threads[0]!.workToken), "changed");
+    assert.equal(yield* orchestrator.getThreadEventSequence(other), before);
+    assert.isTrue(yield* shutdown.release("lease"));
+  }).pipe(Effect.provide(layerShutdownTest)),
+);
+
+it.effect("the admission barrier rejects new messages while leaving Stop available", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const threadId = ThreadId.make("thread:admission-barrier");
+    yield* createWatchingThread(threadId, 35);
+    yield* send(threadId, "active", "start_immediately");
+    assert.isTrue(yield* executor.acquireStartBarrier("lease", Effect.succeed(true)));
+
+    yield* send(threadId, "new", "queue_after_active").pipe(Effect.flip);
+    assert.deepEqual((yield* threadState(threadId)).runs, ["starting"]);
+    yield* orchestrator.dispatch({
+      type: "thread.stop",
+      commandId: CommandId.make("stop:admission-barrier"),
+      threadId,
+      stopDelegatedTasks: false,
+    });
+    assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted"]);
+    assert.isTrue(yield* executor.releaseStartBarrier("lease"));
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("automatic limit recovery waits for shutdown admission before rechecking state", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const threadId = ThreadId.make("thread:admission-limit-recovery");
+    yield* createWatchingThread(threadId, 43);
+    yield* send(threadId, "active", "start_immediately");
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    assert.isTrue(yield* executor.acquireStartBarrier("lease", Effect.succeed(true)));
+    const arm = yield* orchestrator
+      .autoArmLimitRecovery({
+        commandId: CommandId.make("arm:admission-limit-recovery"),
+        threadId,
+        limitRecovery: {
+          runId: run.id,
+          resetAt: "2026-11-27T12:00:00.000Z",
+          autoResume: true,
+          snooze: false,
+        },
+      })
+      .pipe(Effect.forkChild({ startImmediately: true }));
+    assert.isNotTrue(
+      (yield* orchestrator.getThreadProjection(threadId)).thread.limitRecovery?.autoResume,
+    );
+    yield* orchestrator.dispatch({
+      type: "thread.stop",
+      commandId: CommandId.make("stop:admission-limit-recovery"),
+      threadId,
+    });
+    assert.isTrue(yield* executor.releaseStartBarrier("lease"));
+    assert.equal((yield* Fiber.join(arm).pipe(Effect.flip))._tag, "OrchestratorDispatchError");
+    assert.isNotTrue(
+      (yield* orchestrator.getThreadProjection(threadId)).thread.limitRecovery?.autoResume,
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("the admission barrier prevents queued-run recovery from starting work", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const threadId = ThreadId.make("thread:admission-queue");
+    yield* createWatchingThread(threadId, 36);
+    yield* send(threadId, "active", "start_immediately");
+    yield* send(threadId, "queued", "queue_after_active");
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const now = yield* DateTime.now;
+    yield* projections.apply({
+      id: EventId.make("event:admission-queue:completed"),
+      type: "run.updated",
+      threadId,
+      runId: run.id,
+      occurredAt: now,
+      payload: { ...run, status: "completed", completedAt: now },
+    });
+    assert.isTrue(yield* executor.acquireStartBarrier("lease", Effect.succeed(true)));
+    assert.equal(yield* orchestrator.resumeQueuedRuns, 0);
+    assert.deepEqual((yield* threadState(threadId)).runs, ["completed", "queued"]);
+    assert.isTrue(yield* executor.releaseStartBarrier("lease"));
+    yield* orchestrator.resumeQueuedRuns;
+    assert.deepEqual((yield* threadState(threadId)).runs, ["completed", "starting"]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a conditional Stop holds queued work and does not cascade to children", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const sql = yield* SqlClient.SqlClient;
+    const threadId = ThreadId.make("thread:conditional-stop-queue");
+    yield* createWatchingThread(threadId, 33);
+    yield* send(threadId, "active", "start_immediately");
+    yield* delegate(threadId, "child");
+    yield* send(threadId, "queued", "queue_after_active");
+    const workToken = yield* orchestrator.stopWorkToken(threadId);
+
+    const result = yield* orchestrator.stopIfWorkUnchanged({
+      commandId: CommandId.make("stop:conditional-queue"),
+      threadId,
+      workToken,
+    });
+    assert.equal(result, "stopped");
+    assert.deepEqual((yield* threadState(threadId)).runs, ["interrupted", "queued:held"]);
+    const walks = yield* sql<{ readonly effect_id: string }>`
+      SELECT effect_id FROM orchestration_v2_effect_outbox
+      WHERE effect_type = 'delegated-tasks.stop' AND thread_id = ${threadId}
+    `;
+    assert.isEmpty(walks);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a conditional Stop refuses work added to the same run", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:conditional-stop-child");
+    yield* createWatchingThread(threadId, 34);
+    yield* send(threadId, "active", "start_immediately");
+    const workToken = yield* orchestrator.stopWorkToken(threadId);
+    const childThreadId = yield* delegate(threadId, "new child");
+    const result = yield* orchestrator.stopIfWorkUnchanged({
+      commandId: CommandId.make("stop:conditional-child"),
+      threadId,
+      workToken,
+    });
+    assert.equal(result, "changed");
+    assert.equal(
+      (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]?.status,
+      "starting",
+    );
+    assert.deepEqual((yield* threadState(threadId)).runs, ["starting"]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a conditional Stop refuses a link request added after consent", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:conditional-stop-link");
+    yield* createWatchingThread(threadId, 41);
+    yield* send(threadId, "active", "start_immediately");
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const token = yield* orchestrator.stopWorkToken(threadId);
+    const turnItemId = TurnItemId.make("item:conditional-stop-link");
+    yield* orchestrator.dispatch({
+      type: "link_request.record",
+      commandId: CommandId.make("link:conditional-stop"),
+      threadId,
+      runId: run.id,
+      nodeId: run.rootNodeId!,
+      turnItemId,
+      reason: "",
+      linkStatus: "pending",
+    });
+    const result = yield* orchestrator.stopIfWorkUnchanged({
+      commandId: CommandId.make("stop:conditional-link"),
+      threadId,
+      workToken: token,
+    });
+    assert.equal(result, "changed");
+    const item = (yield* orchestrator.getThreadProjection(threadId)).turnItems.find(
+      (candidate) => candidate.id === turnItemId,
+    );
+    assert.equal(item?.type === "link_request" && item.linkStatus, "pending");
+    assert.deepEqual((yield* threadState(threadId)).runs, ["starting"]);
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("a conditional Stop refuses a secret request added after consent", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const threadId = ThreadId.make("thread:conditional-stop-secret");
+    yield* createWatchingThread(threadId, 42);
+    yield* send(threadId, "active", "start_immediately");
+    const run = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
+    const token = yield* orchestrator.stopWorkToken(threadId);
+    const turnItemId = TurnItemId.make("item:conditional-stop-secret");
+    yield* orchestrator.dispatch({
+      type: "secret_request.record",
+      commandId: CommandId.make("secret:conditional-stop"),
+      threadId,
+      runId: run.id,
+      nodeId: run.rootNodeId!,
+      turnItemId,
+      label: "Token",
+      reason: "Needed for the work",
+      secretStatus: "pending",
+    });
+    const result = yield* orchestrator.stopIfWorkUnchanged({
+      commandId: CommandId.make("stop:conditional-secret"),
+      threadId,
+      workToken: token,
+    });
+    assert.equal(result, "changed");
+    const item = (yield* orchestrator.getThreadProjection(threadId)).turnItems.find(
+      (candidate) => candidate.id === turnItemId,
+    );
+    assert.equal(item?.type === "secret_request" && item.secretStatus, "pending");
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect(

@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off -- Local socket ownership checks need lstat, an atomic rename, and a directory watch at the Node adapter boundary.
 import { pipe } from "effect/Function";
 import * as NodeCrypto from "node:crypto";
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeNet from "node:net";
@@ -11,6 +12,8 @@ import {
   DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION,
   DesktopAppActivationRequest,
   type DesktopAppActivationResponse,
+  DesktopSafeShutdownControlRequest,
+  type DesktopSafeShutdownControlResponse,
 } from "@t3tools/contracts";
 import { resolveDesktopAppControlAddress } from "@t3tools/shared/desktopAppControl";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -25,15 +28,92 @@ import * as Scope from "effect/Scope";
 import type * as Electron from "electron";
 
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
+import * as ElectronApp from "../electron/ElectronApp.ts";
 import { DESKTOP_APP_ACTIVATION_REQUEST_CHANNEL } from "../ipc/channels.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 import { DesktopAppActivationBroker } from "./DesktopAppActivationBroker.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopSafeShutdown from "./DesktopSafeShutdown.ts";
 import { makeComponentLogger } from "./DesktopObservability.ts";
 
 const MAX_REQUEST_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const isDesktopAppActivationRequest = Schema.is(DesktopAppActivationRequest);
+const isSafeShutdownRequest = Schema.is(DesktopSafeShutdownControlRequest);
+
+const windowsPrivateDirectoryScript = `
+$ErrorActionPreference = 'Stop'
+$p = $env:T3_SAFE_SHUTDOWN_DIRECTORY
+if ([IO.Directory]::Exists($p) -or [IO.File]::Exists($p)) { throw 'Directory already exists' }
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object Security.AccessControl.DirectorySecurity
+$acl.SetAccessRuleProtection($true, $false)
+$acl.SetOwner($sid)
+$rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+$acl.AddAccessRule($rule)
+[IO.Directory]::CreateDirectory($p, $acl) | Out-Null
+$actual = Get-Acl -LiteralPath $p
+$rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+if (-not $actual.AreAccessRulesProtected -or $actual.GetOwner([Security.Principal.SecurityIdentifier]) -ne $sid -or $rules.Count -ne 1 -or $rules[0].IdentityReference -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or -not $rules[0].FileSystemRights.HasFlag([Security.AccessControl.FileSystemRights]::FullControl) -or -not $rules[0].InheritanceFlags.HasFlag([Security.AccessControl.InheritanceFlags]::ObjectInherit)) { throw 'Directory access is not private' }
+`;
+
+export async function createDesktopControlSecret(stateDir: string, platform: NodeJS.Platform) {
+  const name = `desktop-safe-shutdown-${NodeCrypto.randomBytes(16).toString("hex")}`;
+  const directory = NodePath.join(stateDir, name);
+  const keyPath = NodePath.join(directory, "key");
+  const reference = NodePath.join(stateDir, "desktop-safe-shutdown.ref");
+  const temporary = `${reference}.${NodeCrypto.randomBytes(8).toString("hex")}.tmp`;
+  const secret = NodeCrypto.randomBytes(32).toString("hex");
+  await NodeFSP.mkdir(stateDir, { recursive: true, mode: 0o700 });
+  if (platform === "win32") {
+    const powershell = NodePath.join(
+      process.env.SystemRoot ?? "C:\\Windows",
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    );
+    await new Promise<void>((resolve, reject) =>
+      NodeChildProcess.execFile(
+        powershell,
+        ["-NoProfile", "-NonInteractive", "-Command", windowsPrivateDirectoryScript],
+        { env: { ...process.env, T3_SAFE_SHUTDOWN_DIRECTORY: directory }, windowsHide: true },
+        (error) => (error ? reject(error) : resolve()),
+      ),
+    );
+  } else {
+    await NodeFSP.mkdir(directory, { mode: 0o700 });
+  }
+  try {
+    const stat = await NodeFSP.lstat(directory);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error("Invalid desktop control directory");
+    await NodeFSP.writeFile(keyPath, secret, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    await NodeFSP.unlink(temporary).catch(() => undefined);
+    await NodeFSP.unlink(keyPath).catch(() => undefined);
+    await NodeFSP.rmdir(directory).catch(() => undefined);
+    throw error;
+  }
+  return {
+    secret,
+    publish: async () => {
+      try {
+        await NodeFSP.writeFile(temporary, name, { flag: "wx", mode: 0o600 });
+        await NodeFSP.rename(temporary, reference);
+      } catch (error) {
+        await NodeFSP.unlink(temporary).catch(() => undefined);
+        throw error;
+      }
+    },
+    close: async () => {
+      if ((await NodeFSP.readFile(reference, "utf8").catch(() => "")) === name)
+        await NodeFSP.unlink(reference).catch(() => undefined);
+      await NodeFSP.unlink(keyPath).catch(() => undefined);
+      await NodeFSP.rmdir(directory).catch(() => undefined);
+    },
+  };
+}
 
 export class DesktopAppActivationStartError extends Schema.TaggedError<DesktopAppActivationStartError>()(
   "DesktopAppActivationStartError",
@@ -75,6 +155,19 @@ function requestIdFromUnknown(value: unknown): string {
   return "invalid-request";
 }
 
+export async function handleSafeShutdownControl(
+  secret: string,
+  request: DesktopSafeShutdownControlRequest,
+  execute: (command: DesktopSafeShutdownControlRequest["command"]) => Promise<unknown>,
+): Promise<DesktopSafeShutdownControlResponse> {
+  const expected = Buffer.from(secret, "utf8");
+  const received = Buffer.from(request.secret, "utf8");
+  if (expected.length !== received.length || !NodeCrypto.timingSafeEqual(expected, received))
+    return { version: 1, type: "safe-shutdown", requestId: request.requestId, ok: false };
+  const result = await execute(request.command);
+  return { version: 1, type: "safe-shutdown", requestId: request.requestId, ok: true, result };
+}
+
 async function prepareUnixDirectory(input: {
   readonly directory: string;
   readonly userId: number | undefined;
@@ -110,6 +203,10 @@ export async function startDesktopAppControlServer(input: {
   readonly directory: string | null;
   readonly userId: number | undefined;
   readonly handle: (request: DesktopAppActivationRequest) => Promise<DesktopAppActivationResponse>;
+  readonly handleShutdown?: (
+    request: DesktopSafeShutdownControlRequest,
+  ) => Promise<DesktopSafeShutdownControlResponse>;
+  readonly afterShutdownResponse?: () => void;
   readonly cancel: (requestId: string) => void;
   readonly onReclaimError: (error: unknown) => void;
 }): Promise<RunningControlServer> {
@@ -121,12 +218,24 @@ export async function startDesktopAppControlServer(input: {
     let handled = false;
     let responseSent = false;
     let activeRequestId: string | null = null;
+    let shutdownRequest = false;
 
     socket.setTimeout(5_000, () => socket.destroy());
 
-    const finish = (response: DesktopAppActivationResponse) => {
+    const finish = (
+      response: DesktopAppActivationResponse | DesktopSafeShutdownControlResponse,
+      after?: () => void,
+    ) => {
       responseSent = true;
-      if (!socket.destroyed) socket.end(`${JSON.stringify(response)}\n`);
+      let completed = false;
+      const complete = () => {
+        if (completed) return;
+        completed = true;
+        after?.();
+      };
+      if (socket.destroyed) return complete();
+      if (after !== undefined) socket.once("close", complete);
+      socket.end(`${JSON.stringify(response)}\n`, complete);
     };
 
     socket.on("data", (chunk) => {
@@ -151,6 +260,32 @@ export async function startDesktopAppControlServer(input: {
         return;
       }
 
+      if (isSafeShutdownRequest(parsed) && input.handleShutdown !== undefined) {
+        activeRequestId = parsed.requestId;
+        shutdownRequest = true;
+        void input.handleShutdown(parsed).then(
+          (response) => {
+            const result = response.ok ? response.result : null;
+            const accepted =
+              parsed.command.type === "quit" &&
+              typeof result === "object" &&
+              result !== null &&
+              "type" in result &&
+              result.type === "quit" &&
+              "accepted" in result &&
+              result.accepted === true;
+            finish(response, accepted ? input.afterShutdownResponse : undefined);
+          },
+          () =>
+            finish({
+              version: 1,
+              type: "safe-shutdown",
+              requestId: parsed.requestId,
+              ok: false,
+            }),
+        );
+        return;
+      }
       if (!isDesktopAppActivationRequest(parsed)) {
         pipe(
           requestIdFromUnknown(parsed),
@@ -169,7 +304,8 @@ export async function startDesktopAppControlServer(input: {
     socket.on("error", () => socket.destroy());
     socket.on("close", () => {
       sockets.delete(socket);
-      if (!responseSent && activeRequestId !== null) input.cancel(activeRequestId);
+      if (!responseSent && activeRequestId !== null && !shutdownRequest)
+        input.cancel(activeRequestId);
     });
   };
 
@@ -286,7 +422,11 @@ export async function startDesktopAppControlServer(input: {
 export class DesktopAppActivation extends Context.Service<
   DesktopAppActivation,
   {
-    readonly start: Effect.Effect<void, DesktopAppActivationStartError, Scope.Scope>;
+    readonly start: Effect.Effect<
+      void,
+      DesktopAppActivationStartError,
+      Scope.Scope | DesktopSafeShutdown.DesktopSafeShutdown
+    >;
     readonly setRendererReady: (ready: boolean) => Effect.Effect<void>;
     readonly complete: (response: DesktopAppActivationResponse) => Effect.Effect<void>;
   }
@@ -299,6 +439,7 @@ export const make = Effect.gen(function* () {
   const desktopEnvironment = yield* DesktopEnvironment.DesktopEnvironment;
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   const electronWindow = yield* ElectronWindow.ElectronWindow;
+  const electronApp = yield* ElectronApp.ElectronApp;
   const path = yield* Path.Path;
   const userId = yield* HostProcess.UserId;
   const runPromise = Effect.runPromiseWith(yield* Effect.context<never>());
@@ -331,29 +472,61 @@ export const make = Effect.gen(function* () {
   };
 
   return DesktopAppActivation.of({
-    start: Effect.acquireRelease(
-      Effect.tryPromise({
-        try: () =>
-          startDesktopAppControlServer({
-            ...address,
-            userId,
-            handle: (request) => broker.request(request),
-            cancel: (requestId) => broker.cancel(requestId),
-            onReclaimError: (cause) =>
-              void runPromise(
-                logWarning("failed to restore the desktop app control socket", { cause }),
-              ),
-          }),
-        catch: (cause) => new DesktopAppActivationStartError({ address: address.address, cause }),
-      }),
-      (server) =>
-        Effect.promise(() => server.close()).pipe(
-          Effect.catchCause((cause) =>
-            logWarning("failed to close the desktop app control socket", { cause }),
-          ),
-          Effect.ensuring(Effect.sync(() => broker.close())),
+    start: Effect.gen(function* () {
+      const shutdown = yield* DesktopSafeShutdown.DesktopSafeShutdown;
+      const control = yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () =>
+            createDesktopControlSecret(desktopEnvironment.stateDir, desktopEnvironment.platform),
+          catch: (cause) => new DesktopAppActivationStartError({ address: address.address, cause }),
+        }).pipe(
+          Effect.tapError((error) => logWarning("safe shutdown control is unavailable", { error })),
+          Effect.option,
         ),
-    ).pipe(Effect.asVoid),
+        (control) => (Option.isSome(control) ? Effect.promise(control.value.close) : Effect.void),
+      );
+      yield* Effect.acquireRelease(
+        Effect.tryPromise({
+          try: () =>
+            startDesktopAppControlServer({
+              ...address,
+              userId,
+              handle: (request) => broker.request(request),
+              ...(Option.isSome(control)
+                ? {
+                    handleShutdown: (request: DesktopSafeShutdownControlRequest) =>
+                      handleSafeShutdownControl(control.value.secret, request, (command) =>
+                        runPromise(shutdown.execute(command)),
+                      ),
+                    afterShutdownResponse: () => void runPromise(electronApp.quit),
+                  }
+                : {}),
+              cancel: (requestId) => broker.cancel(requestId),
+              onReclaimError: (cause) =>
+                void runPromise(
+                  logWarning("failed to restore the desktop app control socket", { cause }),
+                ),
+            }),
+          catch: (cause) => new DesktopAppActivationStartError({ address: address.address, cause }),
+        }),
+        (server) =>
+          Effect.promise(() => server.close()).pipe(
+            Effect.catchCause((cause) =>
+              logWarning("failed to close the desktop app control socket", { cause }),
+            ),
+            Effect.ensuring(Effect.sync(() => broker.close())),
+          ),
+      );
+      if (Option.isSome(control)) {
+        yield* Effect.tryPromise({
+          try: control.value.publish,
+          catch: (cause) => new DesktopAppActivationStartError({ address: address.address, cause }),
+        }).pipe(
+          Effect.tapError((error) => logWarning("safe shutdown control is unavailable", { error })),
+          Effect.ignore,
+        );
+      }
+    }),
     setRendererReady: Effect.fn("DesktopAppActivation.setRendererReady")(function* (ready) {
       if (!ready) {
         clearRegisteredRenderer();

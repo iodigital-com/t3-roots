@@ -26,6 +26,7 @@ import * as DesktopBackendConfiguration from "./DesktopBackendConfiguration.ts";
 import * as DesktopBackendManager from "./DesktopBackendManager.ts";
 import * as DesktopHomeOwner from "./DesktopHomeOwner.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
+import * as DesktopQuitAdmission from "../app/DesktopQuitAdmission.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
 import * as DesktopState from "../app/DesktopState.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
@@ -76,6 +77,7 @@ export class DesktopBackendPool extends Context.Service<
     readonly get: (id: BackendInstanceId) => Effect.Effect<Option.Option<DesktopBackendInstance>>;
     readonly list: Effect.Effect<readonly DesktopBackendInstance[]>;
     readonly primary: Effect.Effect<DesktopBackendInstance>;
+    readonly quitAdmission: DesktopQuitAdmission.DesktopQuitAdmission;
     readonly register: (
       spec: BackendInstanceSpec,
     ) => Effect.Effect<DesktopBackendInstance, DesktopBackendPoolInstanceAlreadyRegisteredError>;
@@ -119,6 +121,7 @@ type UnregisterAction =
 export const layer = Layer.effect(
   DesktopBackendPool,
   Effect.gen(function* () {
+    const quitAdmission = yield* DesktopQuitAdmission.make;
     const environment = yield* DesktopEnvironment.DesktopEnvironment;
     const fileSystem = yield* FileSystem.FileSystem;
     const configuration = yield* DesktopBackendConfiguration.DesktopBackendConfiguration;
@@ -221,43 +224,46 @@ export const layer = Layer.effect(
       },
     );
 
-    const primary = yield* DesktopBackendManager.makeBackendInstance({
-      id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
-      // Resolve lazily: startup loads persisted settings after pool initialization.
-      label: configuration.resolvePrimaryLabel,
-      configResolve: configuration.resolvePrimary,
-      // Absorb window errors so readiness can reset restartAttempt.
-      onReady: (httpBaseUrl, pid) =>
-        FiberHandle.run(updateMarkerWait, releaseUpdateMarker(httpBaseUrl, pid)).pipe(
-          Effect.andThen(reloadStaleMain),
-          Effect.andThen(desktopWindow.handleBackendReady(httpBaseUrl)),
-          // Only once the main window exists, so the recovery window never closes into nothing.
-          Effect.andThen(SubscriptionRef.set(primaryBackendStartup, { _tag: "Ready" })),
-          Effect.catch((error) =>
-            logBackendPoolWarning("failed to open main window after backend readiness", {
-              error: error.message,
-            }),
-          ),
-        ),
-      onStartupFailure: (failure) =>
-        SubscriptionRef.set(primaryBackendStartup, { _tag: "Failing", ...failure }),
-      onShutdown: () =>
-        FiberHandle.clear(updateMarkerWait).pipe(
-          Effect.andThen(desktopWindow.handleBackendNotReady),
-        ),
-      onPreflightFailed: handlePrimaryPreflightFailure,
-      onStateDirOwned: () =>
-        DesktopHomeOwner.readLiveHomeOwner().pipe(
-          Effect.flatMap((owner) =>
-            electronDialog.showErrorBox(
-              m(msg("This T3 home is unavailable")),
-              DesktopHomeOwner.homeOwnedMessage(owner),
+    const primary = yield* DesktopBackendManager.makeBackendInstance(
+      {
+        id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
+        // Resolve lazily: startup loads persisted settings after pool initialization.
+        label: configuration.resolvePrimaryLabel,
+        configResolve: configuration.resolvePrimary,
+        // Absorb window errors so readiness can reset restartAttempt.
+        onReady: (httpBaseUrl, pid) =>
+          FiberHandle.run(updateMarkerWait, releaseUpdateMarker(httpBaseUrl, pid)).pipe(
+            Effect.andThen(reloadStaleMain),
+            Effect.andThen(desktopWindow.handleBackendReady(httpBaseUrl)),
+            // Only once the main window exists, so the recovery window never closes into nothing.
+            Effect.andThen(SubscriptionRef.set(primaryBackendStartup, { _tag: "Ready" })),
+            Effect.catch((error) =>
+              logBackendPoolWarning("failed to open main window after backend readiness", {
+                error: error.message,
+              }),
             ),
           ),
-          Effect.provideContext(homeOwnerContext),
-          Effect.andThen(electronApp.quit),
-        ),
-    });
+        onStartupFailure: (failure) =>
+          SubscriptionRef.set(primaryBackendStartup, { _tag: "Failing", ...failure }),
+        onShutdown: () =>
+          FiberHandle.clear(updateMarkerWait).pipe(
+            Effect.andThen(desktopWindow.handleBackendNotReady),
+          ),
+        onPreflightFailed: handlePrimaryPreflightFailure,
+        onStateDirOwned: () =>
+          DesktopHomeOwner.readLiveHomeOwner().pipe(
+            Effect.flatMap((owner) =>
+              electronDialog.showErrorBox(
+                m(msg("This T3 home is unavailable")),
+                DesktopHomeOwner.homeOwnedMessage(owner),
+              ),
+            ),
+            Effect.provideContext(homeOwnerContext),
+            Effect.andThen(electronApp.quit),
+          ),
+      },
+      quitAdmission,
+    );
 
     const instancesRef = yield* SynchronizedRef.make<
       ReadonlyMap<BackendInstanceId, RegisteredInstance>
@@ -271,56 +277,58 @@ export const layer = Layer.effect(
     );
 
     const register: DesktopBackendPool["Service"]["register"] = (spec) =>
-      Effect.suspend(() =>
-        SynchronizedRef.modifyEffect(
-          instancesRef,
-          (
-            current,
-          ): Effect.Effect<
-            readonly [RegisterAction, ReadonlyMap<BackendInstanceId, RegisteredInstance>],
-            DesktopBackendPoolInstanceAlreadyRegisteredError
-          > => {
-            const existing = current.get(spec.id);
-            if (existing?._tag === "Active") {
-              return Effect.fail(
-                new DesktopBackendPoolInstanceAlreadyRegisteredError({ id: spec.id }),
-              );
-            }
-            if (existing?._tag === "Closing") {
-              return Effect.succeed([
-                { _tag: "Wait", done: existing.done } as const,
-                current,
-              ] as const);
-            }
-            return Effect.gen(function* () {
-              // Provide the child Scope last so the captured pool Scope cannot shadow it and orphan stop/restart finalizers.
-              const instanceScope = yield* Scope.fork(layerScope, "sequential");
-              const instance = yield* DesktopBackendManager.makeBackendInstance(spec).pipe(
-                Scope.provide(instanceScope),
-                Effect.provide(factoryContext),
-              );
-              const next = new Map(current);
-              next.set(spec.id, {
-                _tag: "Active",
-                instance,
-                scope: Option.some(instanceScope),
+      quitAdmission.run(
+        Effect.suspend(() =>
+          SynchronizedRef.modifyEffect(
+            instancesRef,
+            (
+              current,
+            ): Effect.Effect<
+              readonly [RegisterAction, ReadonlyMap<BackendInstanceId, RegisteredInstance>],
+              DesktopBackendPoolInstanceAlreadyRegisteredError
+            > => {
+              const existing = current.get(spec.id);
+              if (existing?._tag === "Active") {
+                return Effect.fail(
+                  new DesktopBackendPoolInstanceAlreadyRegisteredError({ id: spec.id }),
+                );
+              }
+              if (existing?._tag === "Closing") {
+                return Effect.succeed([
+                  { _tag: "Wait", done: existing.done } as const,
+                  current,
+                ] as const);
+              }
+              return Effect.gen(function* () {
+                // Provide the child Scope last so the captured pool Scope cannot shadow it and orphan stop/restart finalizers.
+                const instanceScope = yield* Scope.fork(layerScope, "sequential");
+                const instance = yield* DesktopBackendManager.makeBackendInstance(
+                  spec,
+                  quitAdmission,
+                ).pipe(Scope.provide(instanceScope), Effect.provide(factoryContext));
+                const next = new Map(current);
+                next.set(spec.id, {
+                  _tag: "Active",
+                  instance,
+                  scope: Option.some(instanceScope),
+                });
+                return [
+                  { _tag: "Registered", instance } as const,
+                  next as ReadonlyMap<BackendInstanceId, RegisteredInstance>,
+                ] as const;
               });
-              return [
-                { _tag: "Registered", instance } as const,
-                next as ReadonlyMap<BackendInstanceId, RegisteredInstance>,
-              ] as const;
-            });
-          },
-        ).pipe(
-          Effect.flatMap((result) =>
-            result._tag === "Registered"
-              ? Effect.succeed(result.instance)
-              : Deferred.await(result.done).pipe(Effect.andThen(register(spec))),
+            },
+          ).pipe(
+            Effect.flatMap((result) =>
+              result._tag === "Registered"
+                ? Effect.succeed(result.instance)
+                : Deferred.await(result.done).pipe(Effect.andThen(register(spec))),
+            ),
           ),
         ),
       );
 
-    const unregister: DesktopBackendPool["Service"]["unregister"] = Effect.fn(
+    const unregisterUnadmitted: DesktopBackendPool["Service"]["unregister"] = Effect.fn(
       "DesktopBackendPool.unregister",
     )(function* (id) {
       if (id === DesktopBackendManager.PRIMARY_INSTANCE_ID) {
@@ -391,8 +399,11 @@ export const layer = Layer.effect(
         ),
       ),
       primary: Effect.succeed(primary),
+      quitAdmission,
       register,
-      unregister,
+      unregister: Effect.fn("DesktopBackendPool.admittedUnregister")((id) =>
+        quitAdmission.run(unregisterUnadmitted(id)),
+      ),
     });
   }),
 );
@@ -403,6 +414,7 @@ export const layerTest = (
   Layer.effect(
     DesktopBackendPool,
     Effect.gen(function* () {
+      const quitAdmission = yield* DesktopQuitAdmission.make;
       if (instances.length === 0) {
         return yield* Effect.die("DesktopBackendPool.layerTest requires at least one instance");
       }
@@ -416,6 +428,7 @@ export const layerTest = (
         }),
         list: Effect.succeed(Array.from(byId.values())),
         primary: Effect.succeed(primary),
+        quitAdmission,
         register: Effect.fn("DesktopBackendPool.register")(function () {
           return Effect.die("DesktopBackendPool.layerTest does not support register");
         }),
