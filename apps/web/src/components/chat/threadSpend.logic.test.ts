@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { CommandId, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { threadKey } from "@t3tools/client-runtime/state/entities";
 import type { EnvironmentThreadShell, ThreadStructure } from "@t3tools/client-runtime/state/shell";
 import { collectThreadSpend, threadSpendNode, type SpendNode } from "./threadSpend.logic";
@@ -217,7 +217,7 @@ describe("thread spend", () => {
     }
   });
 
-  it("keeps session coverage unknown after older chat pages load without provider turns", () => {
+  it("keeps spend coverage unknown after history paging or rollback", () => {
     const ref = { environmentId: EnvironmentId.make("local"), threadId: ThreadId.make("root") };
     const projection = {
       thread: { id: ref.threadId, title: "Root", activeProviderThreadId: "provider-thread" },
@@ -252,6 +252,19 @@ describe("thread spend", () => {
       expect(result.totals).toEqual([{ currency: "USD", amount: 1 }]);
       expect(result.complete).toBe(history === fullHistory);
     }
+    const rolledBack = {
+      ...projection,
+      thread: { ...projection.thread, rollbackRequestId: CommandId.make("rollback") },
+    };
+    // Rolled-back child records and archived or hidden shells can both be absent.
+    const afterRollback = collectThreadSpend("root", () =>
+      threadSpendNode(ref, rolledBack, [], fullHistory),
+    );
+    expect(afterRollback.totals).toEqual([{ currency: "USD", amount: 1 }]);
+    expect(afterRollback.complete).toBe(false);
+    expect(afterRollback.rows).toEqual(
+      expect.arrayContaining([expect.objectContaining({ key: "\0missing:root", cost: null })]),
+    );
   });
 
   it("keeps independent accounts and environments with identical native ids separate", () => {

@@ -138,7 +138,8 @@ export function threadSpendNode(
     active?.nativeThreadRef?.strength === "strong" ? active.nativeThreadRef.nativeId : null;
   const children = new Map<string, boolean>();
   const nativeSessions = new Map<string, { key: string; label: string; cost: SpendCost | null }>();
-  let unknownChildren = false;
+  // Rollbacks can remove settled child records from both the timeline and visible shells.
+  let unknownChildren = projection.thread.rollbackRequestId !== undefined;
   for (const agent of projection.subagents) {
     const child = agent.remoteChild
       ? scopeThreadRef(agent.remoteChild.environmentId, agent.remoteChild.threadId)
