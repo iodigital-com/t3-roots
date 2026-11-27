@@ -74,6 +74,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
             id: PRIMARY_LOCAL_ENVIRONMENT_ID,
             label: Effect.succeed("Windows"),
             currentConfig: Effect.succeedSome(config),
+            snapshot: Effect.succeed({ activeRunId: 1 }),
             waitForReady: (timeout: Duration.Duration) =>
               Deferred.succeed(waiting, undefined).pipe(
                 Effect.andThen(Deferred.await(ready)),
@@ -139,6 +140,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
               id: PRIMARY_LOCAL_ENVIRONMENT_ID,
               label: Effect.succeed("Windows"),
               waitForReady: () => Effect.succeed(true),
+              snapshot: Effect.succeed({ activeRunId: 1 }),
               currentConfig: Effect.succeedSome({
                 ...config,
                 bootstrap: { ...config.bootstrap, desktopBootstrapSecret: "desktop-secret" },
@@ -189,6 +191,7 @@ describe("DesktopLocalEnvironmentAuth", () => {
         id: PRIMARY_LOCAL_ENVIRONMENT_ID,
         label: Effect.succeed("Windows"),
         currentConfig: Effect.succeedSome(config),
+        snapshot: Effect.succeed({ activeRunId: 1 }),
         waitForReady: () => Effect.succeed(true),
       },
     ]),
@@ -217,6 +220,18 @@ describe("DesktopLocalEnvironmentAuth", () => {
       );
       return { auth, requestCount };
     });
+
+  it.effect("refreshes the cached desktop session after it expires", () =>
+    Effect.gen(function* () {
+      const { auth, requestCount } = yield* makeExchange(0, () => new Response());
+      yield* auth.getBearerToken;
+      yield* auth.getBearerToken;
+      assert.strictEqual(yield* Ref.get(requestCount), 1);
+      yield* TestClock.adjust("1 hour");
+      yield* auth.getBearerToken;
+      assert.strictEqual(yield* Ref.get(requestCount), 2);
+    }),
+  );
 
   it.effect("does not retry a rejected bootstrap credential", () =>
     Effect.gen(function* () {

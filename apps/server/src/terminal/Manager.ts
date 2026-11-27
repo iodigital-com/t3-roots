@@ -16,6 +16,7 @@ import {
   TerminalError,
   TerminalHistoryError,
   TerminalNotRunningError,
+  TerminalShutdownInProgressError,
   TerminalProviderInstanceNotFoundError,
   TerminalProviderEnvironmentError,
   TerminalResizeError,
@@ -78,6 +79,7 @@ import { expandHomeVariable } from "@t3tools/provider-core/server/pathExpansion"
 import * as ProcessRunner from "../processRunner.ts";
 import * as PortScanner from "../preview/PortScanner.ts";
 import * as NativeTelemetryClient from "../resourceTelemetry/NativeTelemetryClient.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import { terminalOutputStream } from "./OutputProtocol.ts";
 import * as PtyAdapter from "@t3tools/shared/PtyAdapter";
 
@@ -180,6 +182,7 @@ export class TerminalManager extends Context.Service<
     readonly open: (
       input: TerminalOpenInput,
     ) => Effect.Effect<TerminalSessionSnapshot, TerminalError>;
+    readonly hasTerminalProcesses: Effect.Effect<boolean>;
 
     readonly getShell: (input: TerminalObserveInput) => Effect.Effect<string, TerminalError>;
 
@@ -1667,6 +1670,9 @@ interface TerminalManagerOptions {
   historyLineLimit?: number;
   historyByteLimit?: number;
   ptyAdapter: PtyAdapter.PtyAdapter["Service"];
+  admitStart?: <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | TerminalShutdownInProgressError, R>;
   shellResolver?: () => string;
   env?: NodeJS.ProcessEnv;
   managedBinaryCacheDir?: string;
@@ -1749,6 +1755,7 @@ export const make = Effect.fn("TerminalManager.make")(function* (
   const portDiscovery = yield* PortScanner.PortDiscovery;
   const nativeTelemetry = yield* NativeTelemetryClient.NativeTelemetryClient;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const path = yield* Path.Path;
   const resolveProviderInstanceEnvironment = Effect.fn(
     "terminal.resolveProviderInstanceEnvironment",
@@ -1764,6 +1771,12 @@ export const make = Effect.fn("TerminalManager.make")(function* (
   return yield* makeWithOptions({
     logsDir: terminalLogsDir,
     ptyAdapter,
+    admitStart: (effect) =>
+      commands.withStartAdmission(effect).pipe(
+        Effect.catchTags({
+          StartAdmissionBlocked: () => Effect.fail(new TerminalShutdownInProgressError()),
+        }),
+      ),
     processTable: nativeTelemetry.processTable.pipe(
       Effect.mapError(
         (cause) => new TerminalSubprocessCheckError({ cause, command: "resource-monitor" }),
@@ -3388,9 +3401,11 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   });
 
   const openLocked = (input: TerminalOpenInput) =>
-    withWorkspaceLease(
-      path.resolve(input.worktreePath ?? input.cwd),
-      openWithWorkspaceLease(input),
+    (options.admitStart ?? ((effect) => effect))(
+      withWorkspaceLease(
+        path.resolve(input.worktreePath ?? input.cwd),
+        openWithWorkspaceLease(input),
+      ),
     );
 
   const open: TerminalManager["Service"]["open"] = (input) =>
@@ -3940,6 +3955,13 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
   return TerminalManager.of({
     open,
+    hasTerminalProcesses: readManagerState.pipe(
+      Effect.map(
+        (state) =>
+          state.killFibers.size > 0 ||
+          [...state.sessions.values()].some((session) => session.process !== null),
+      ),
+    ),
     getShell,
     attachStream,
     attachOutputStream,
@@ -3957,4 +3979,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 });
 
 export const layer = (deriveConfigMap: typeof deriveProviderInstanceConfigMap) =>
-  Layer.effect(TerminalManager, make(deriveConfigMap)).pipe(Layer.provide(ProcessRunner.layer));
+  Layer.effect(TerminalManager, make(deriveConfigMap)).pipe(
+    Layer.provide(ProcessRunner.layer),
+    Layer.provide(ThreadCommandExecutor.layer),
+  );

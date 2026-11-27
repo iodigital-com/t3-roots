@@ -2,6 +2,8 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import { expect, it } from "@effect/vitest";
 import { ScheduledTaskUpsertInput } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -9,6 +11,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { afterEach, vi } from "vite-plus/test";
 
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -48,6 +51,36 @@ const input = {
   runtimeMode: "full-access",
   interactionMode: "default",
 };
+
+it.effect("a paused admission does not consume a scheduled task occurrence", () =>
+  Effect.gen(function* () {
+    const service = yield* ScheduledTaskService.ScheduledTaskService;
+    const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+    const decoded = yield* decodeInput({
+      ...input,
+      schedule: { type: "interval", everyMs: 60_000 },
+    });
+    const created = yield* service.upsert(decoded);
+    expect(yield* executor.acquireStartBarrier("lease", Effect.succeed(true))).toBe(true);
+    const finished = yield* Deferred.make<void>();
+    const pending = yield* service
+      .runNow({ id: created.task.id })
+      .pipe(
+        Effect.ensuring(Deferred.succeed(finished, undefined)),
+        Effect.forkChild({ startImmediately: true }),
+      );
+    expect(yield* Deferred.isDone(finished)).toBe(false);
+    expect((yield* service.list()).tasks[0]?.lastRunStatus).toBe("never");
+    expect((yield* service.list()).tasks[0]?.runCount).toBe(0);
+    expect(yield* executor.releaseStartBarrier("lease")).toBe(true);
+    yield* Fiber.join(pending);
+    expect((yield* service.list()).tasks[0]?.runCount).toBe(1);
+  }).pipe(
+    Effect.provide(serviceLayer.pipe(Layer.provideMerge(ThreadCommandExecutor.layer))),
+    Effect.provideService(ServerActivation, Effect.never),
+    Effect.provide(SqlitePersistence.layerMemory),
+  ),
+);
 
 it.effect.each([
   {

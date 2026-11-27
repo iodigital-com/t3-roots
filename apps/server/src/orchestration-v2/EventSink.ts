@@ -40,6 +40,12 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
+/** A conditional command was planned against an older thread event sequence. */
+export class CommandSequenceChanged extends Schema.TaggedError<CommandSequenceChanged>()(
+  "CommandSequenceChanged",
+  {},
+) {}
+
 export class EventSinkWriteError extends Schema.TaggedError<EventSinkWriteError>()(
   "EventSinkWriteError",
   {
@@ -209,6 +215,7 @@ export interface EventSinkV2Shape {
     readonly threadId: ThreadId;
     readonly commandType: string;
     readonly acceptedAt: DateTime.Utc;
+    readonly expectedSequence?: number;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
     readonly effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
     readonly cancelUnsettledEffects?: {
@@ -791,6 +798,13 @@ const layerBase: Layer.Layer<
       const result = yield* commitThenPublish(
         [input.threadId, ...projectedThreadIds(input.events)],
         Effect.gen(function* () {
+          if (
+            input.expectedSequence !== undefined &&
+            (yield* eventStore.latestSequence({ threadId: input.threadId })) !==
+              input.expectedSequence
+          ) {
+            return yield* new CommandSequenceChanged();
+          }
           const reserved = yield* commandReceipts.insertIfAbsent({
             commandId: input.commandId,
             threadId: input.threadId,
@@ -850,7 +864,7 @@ const layerBase: Layer.Layer<
           // A Stop that changes nothing can still queue the stop of its delegated tasks.
           const sequence =
             storedEvents.at(-1)?.sequence ??
-            (input.effects.length === 0
+            (input.effects.length === 0 && input.expectedSequence === undefined
               ? undefined
               : yield* eventStore.latestSequence({ threadId: input.threadId }));
           if (sequence === undefined) {

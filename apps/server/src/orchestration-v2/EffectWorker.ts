@@ -30,6 +30,7 @@ import * as ProviderTurnStartService from "./ProviderTurnStartService.ts";
 import * as RuntimeRequestService from "./RuntimeRequestService.ts";
 import * as ThreadTitleRegenerationService from "./ThreadTitleRegenerationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 
@@ -115,6 +116,7 @@ export const layerExecutor: Layer.Layer<
     const threadTitleRegeneration =
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
+    const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const settings = yield* ServerSettings.ServerSettingsService;
     const startRun = (
@@ -154,7 +156,7 @@ export const layerExecutor: Layer.Layer<
             ),
         ),
       );
-    return OrchestrationEffectExecutorV2.of({
+    const implementation = OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
@@ -715,8 +717,17 @@ export const layerExecutor: Layer.Layer<
         }
       }),
     });
+    return OrchestrationEffectExecutorV2.of({
+      // The underlying execution already owns the operation span.
+      execute: Effect.fnUntraced(function* (effect, options) {
+        const execution = implementation.execute(effect, options);
+        return yield* EffectOutbox.START_EFFECT_TYPES.some((type) => type === effect.request.type)
+          ? threadCommands.awaitStartAdmission(execution)
+          : execution;
+      }),
+    });
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));
 
 // A running effect blocks later work on its thread and its lease is never reclaimed in-process,
 // so a stop that hangs must give up and fall through to the normal retry/fail path.

@@ -16,6 +16,7 @@ import {
   terminalSequenceEnd,
   terminalSequenceStateAfter,
   TerminalProviderInstanceNotFoundError,
+  TerminalShutdownInProgressError,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { SpawnExecutableResolution } from "@t3tools/shared/shell";
@@ -44,6 +45,7 @@ import { expect, vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -239,6 +241,7 @@ const historyLogPath = (logsDir: string, threadId = "thread-1") =>
   );
 
 interface CreateManagerOptions {
+  admitStart?: Parameters<typeof TerminalManager.makeWithOptions>[0]["admitStart"];
   shellResolver?: () => string;
   env?: NodeJS.ProcessEnv;
   subprocessInspector?: (terminalPid: number) => Effect.Effect<{
@@ -293,6 +296,7 @@ const createManager = (
         logsDir,
         historyLineLimit,
         ptyAdapter,
+        ...(options.admitStart === undefined ? {} : { admitStart: options.admitStart }),
         ...(options.historyByteLimit !== undefined
           ? { historyByteLimit: options.historyByteLimit }
           : {}),
@@ -594,6 +598,28 @@ it.layer(
       assert.equal(second.threadId, "thread-1");
       assert.equal(third.threadId, "thread-1");
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
+  it.effect("a shutdown barrier prevents terminal creation before a pseudo-terminal starts", () =>
+    Effect.gen(function* () {
+      const commands = yield* ThreadCommandExecutor.make;
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        admitStart: (effect) =>
+          commands.withStartAdmission(effect).pipe(
+            Effect.catchTags({
+              StartAdmissionBlocked: () => Effect.fail(new TerminalShutdownInProgressError()),
+            }),
+          ),
+      });
+      assert.isTrue(yield* commands.acquireStartBarrier("lease", Effect.succeed(true)));
+      const error = yield* Effect.flip(manager.open(openInput()));
+      assert.equal(error._tag, "TerminalShutdownInProgressError");
+      assert.isEmpty(ptyAdapter.spawnInputs);
+      assert.isFalse(yield* manager.hasTerminalProcesses);
+      yield* commands.releaseStartBarrier("lease");
+      yield* manager.open(openInput());
+      assert.isTrue(yield* manager.hasTerminalProcesses);
     }),
   );
 
@@ -2133,7 +2159,7 @@ it.layer(
   it.effect("starts an existing $SHELL whose path contains spaces before a dash", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
-      const { join } = yield* Path.Path;
+      const { join, resolve } = yield* Path.Path;
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3code-shell-path-" });
       const bin = join(root, "Jane -Doe Smith", ".local", "bin");
       yield* fs.makeDirectory(bin, { recursive: true });
@@ -2158,17 +2184,18 @@ it.layer(
       yield* manager.open(openInput());
 
       expect(ptyAdapter.spawnInputs.map((input) => input.shell)).toEqual([
-        "/shell-fixture/Jane -Doe Smith/.local/bin/fish",
+        resolve(process.cwd(), "/shell-fixture/Jane -Doe Smith/.local/bin/fish"),
       ]);
     }),
   );
 
   it.effect("keeps missing or quoted $SHELL paths that contain spaces", () =>
     Effect.gen(function* () {
+      const { resolve } = yield* Path.Path;
       for (const [shell, expected] of [
         ["/Users/Jane Doe/.local/bin/fish", "/Users/Jane Doe/.local/bin/fish"],
         ['"/opt/my -shell/fish" -l', "/opt/my -shell/fish"],
-      ]) {
+      ] as const) {
         const { manager, ptyAdapter } = yield* createManager(5, {
           env: { SHELL: shell },
         }).pipe(Effect.provide(layerWithHostPlatform("darwin")));
@@ -2178,7 +2205,7 @@ it.layer(
         expect(
           ptyAdapter.spawnInputs.map((input) => input.shell),
           shell,
-        ).toEqual([expected]);
+        ).toEqual([resolve(process.cwd(), expected)]);
       }
     }),
   );
@@ -2243,13 +2270,16 @@ it.layer(
     { platform: "linux", shell: "/opt/custom shell/bin/bash" },
   ] as const)("prefers the configured terminal shell on $platform: $shell", ({ platform, shell }) =>
     Effect.gen(function* () {
+      const { resolve } = yield* Path.Path;
       const { manager, ptyAdapter } = yield* createManager(5, {
         env: { T3CODE_TERMINAL_SHELL: ` ${shell} `, SHELL: "/bin/zsh" },
       }).pipe(Effect.provide(layerWithHostPlatform(platform)));
 
       yield* manager.open(openInput());
 
-      expect(ptyAdapter.spawnInputs[0]?.shell).toBe(shell);
+      expect(ptyAdapter.spawnInputs[0]?.shell).toBe(
+        platform === "win32" ? shell : resolve(process.cwd(), shell),
+      );
     }),
   );
 

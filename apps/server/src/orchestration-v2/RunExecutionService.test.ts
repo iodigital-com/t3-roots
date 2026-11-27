@@ -3921,6 +3921,38 @@ it.effect("does not start a turn whose run settled during the app context read",
   }),
 );
 
+it.effect("does not start a provider turn stopped while admission was paused", () =>
+  Effect.gen(function* () {
+    const executorReady =
+      yield* Deferred.make<ThreadCommandExecutor.ThreadCommandExecutor["Service"]>();
+    const contextReady = yield* Deferred.make<void>();
+    const endEvents = yield* Deferred.make<void>();
+    const current = yield* Ref.make(true);
+    const providerCalls = yield* Ref.make(0);
+    const run = yield* captureRootRunTermination({
+      key: "start-admission-stop",
+      skipIngestionWait: true,
+      beforeStart: (executor) =>
+        executor
+          .acquireStartBarrier("lease", Effect.succeed(true))
+          .pipe(Effect.andThen(Deferred.succeed(executorReady, executor)), Effect.asVoid),
+      shouldStartProviderTurn: () => Ref.get(current),
+      shouldFinalizeRun: () => Ref.get(current),
+      events: () => Stream.fromEffect(Deferred.await(endEvents)).pipe(Stream.drain),
+      appContext: Deferred.succeed(contextReady, undefined).pipe(Effect.as([])),
+      startTurn: () => Ref.update(providerCalls, (count) => count + 1),
+    }).pipe(Effect.forkChild);
+    const endedEarly = Fiber.join(run).pipe(Effect.andThen(Effect.die("Run ended before startup")));
+    const executor = yield* Effect.raceFirst(Deferred.await(executorReady), endedEarly);
+    yield* Effect.raceFirst(Deferred.await(contextReady), endedEarly);
+    yield* Ref.set(current, false);
+    assert.isTrue(yield* executor.releaseStartBarrier("lease"));
+    yield* Deferred.succeed(endEvents, undefined);
+    yield* Fiber.join(run);
+    assert.equal(yield* Ref.get(providerCalls), 0);
+  }),
+);
+
 it.effect("keeps completed runs completed when pull request refresh fails", () =>
   Effect.gen(function* () {
     const { observed } = yield* captureRootRunTermination({
@@ -4010,6 +4042,10 @@ function captureRootRunTermination(input: {
   readonly onSubscriptionClose?: Effect.Effect<void>;
   readonly shouldStartProviderTurn?: RunExecutionService.RunExecutionServiceV2StartRootRunInput["shouldStartProviderTurn"];
   readonly appContext?: ReturnType<McpAppModelContext.McpAppModelContext["Service"]["forThread"]>;
+  readonly beforeStart?: (
+    executor: ThreadCommandExecutor.ThreadCommandExecutor["Service"],
+  ) => Effect.Effect<void>;
+  readonly skipIngestionWait?: boolean;
   readonly ingestNormalized?: ProviderEventIngestor.ProviderEventIngestorV2["Service"]["ingestNormalized"];
   readonly beforeTerminalWrite?: (
     request: Parameters<EventSink.EventSinkV2["Service"]["writeIfRunCurrent"]>[0],
@@ -4148,10 +4184,13 @@ function captureRootRunTermination(input: {
         ),
       ),
       Layer.provideMerge(PreviewAgentActivity.layer),
+      Layer.provideMerge(ThreadCommandExecutor.layer),
     );
 
     const previewActivityEnded = yield* Effect.gen(function* () {
       const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
+      const executor = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+      yield* input.beforeStart?.(executor) ?? Effect.void;
       const start = runExecution.startRootRun({
         commandId: CommandId.make(`command:${input.key}`),
         appThread: rootAppThread(ids.threadId),
@@ -4260,7 +4299,7 @@ function captureRootRunTermination(input: {
         Effect.catch((error) => input.onStartFailure?.(error) ?? Effect.fail(error)),
       );
       yield* input.afterStart?.(ingestionDone) ?? Effect.void;
-      yield* Deferred.await(ingestionDone);
+      if (!input.skipIngestionWait) yield* Deferred.await(ingestionDone);
       const activity = yield* PreviewAgentActivity.PreviewAgentActivity;
       return !(yield* activity.active(ids.threadId));
     }).pipe(Effect.provide(layerTest));
