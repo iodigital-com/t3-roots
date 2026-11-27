@@ -241,7 +241,7 @@ import {
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { titleRegenerationToast } from "./threadTitleRegenerationToast";
 import { copyThreadReference } from "../lib/copyThreadReference";
-import { bridgeIssueForAction, bridgeWorklogUrl } from "../lib/bridgeWorklog";
+import { useBridgeWorklog } from "../hooks/useBridgeWorklog";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { Button } from "./ui/button";
 import { isProjectPinShortcut, ProjectPinButton } from "./ProjectPinButton";
@@ -923,6 +923,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   } = useSidebarLookups();
   const delegatedUnderParent = useDelegatedUnderParent();
   const router = useRouter();
+  const openBridge = useBridgeWorklog();
   const { isMobile, setOpenMobile } = useSidebar();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
@@ -2676,7 +2677,6 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                   : null,
               isPinned,
               isSettled,
-              issues: thread.issues,
               autoSettleEnabled: thread.autoSettleDisabledAt == null,
               isSnoozed,
               canSnoozeNow: canSnooze(thread, { now: new Date().toISOString() }),
@@ -2715,13 +2715,18 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
           if (preset) attemptSnooze(threadRef, preset);
           return;
         }
-        if (clicked.value === "settle-bridge" || clicked.value.startsWith("settle-bridge:")) {
-          const issue = bridgeIssueForAction(thread.issues, clicked.value);
-          if (issue === undefined) return;
+        if (clicked.value === "settle-bridge") {
           try {
-            await api.shell.openExternal(
-              bridgeWorklogUrl({ issue, title: thread.title, now: new Date() }),
-            );
+            if (
+              !(await openBridge({
+                api,
+                threadRef,
+                title: thread.title,
+                links: thread.issues,
+                position,
+              }))
+            )
+              return;
           } catch (error) {
             toastManager.add(
               stackedThreadToast({

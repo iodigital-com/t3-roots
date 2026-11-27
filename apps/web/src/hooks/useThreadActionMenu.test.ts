@@ -27,8 +27,9 @@ const state = vi.hoisted(() => ({
       position: { x: number; y: number },
     ) => Promise<ThreadActionMenuId | null>
   >(),
-  openExternal: vi.fn(async (_url: string) => {
+  openBridge: vi.fn(async (_input: unknown) => {
     state.effects.push("open");
+    return true;
   }),
 }));
 
@@ -75,7 +76,6 @@ vi.mock("../state/use-atom-command", () => ({
 vi.mock("../localApi", () => ({
   readLocalApi: () => ({
     contextMenu: { show: state.show, close: () => {} },
-    shell: { openExternal: state.openExternal },
     dialogs: {
       confirm: async () => {
         recordEffect("confirm");
@@ -114,6 +114,7 @@ vi.mock("./useCopyToClipboard", () => ({
 vi.mock("./useHandleNewThread", () => ({
   useNewThreadHandler: () => async () => recordEffect("draft"),
 }));
+vi.mock("./useBridgeWorklog", () => ({ useBridgeWorklog: () => state.openBridge }));
 vi.mock("./useSettings", () => ({
   useClientSettings: (select: (settings: unknown) => unknown) =>
     select({
@@ -167,7 +168,10 @@ beforeEach(() => {
   state.effects = [];
   state.completed = deferred<void>();
   state.show.mockReset().mockResolvedValue(null);
-  state.openExternal.mockClear();
+  state.openBridge.mockReset().mockImplementation(async () => {
+    state.effects.push("open");
+    return true;
+  });
 });
 
 describe("thread menu permissions", () => {
@@ -212,15 +216,13 @@ describe("settle and book hours", () => {
     createMenu().openMenu(position);
     await state.completed.promise;
     expect(state.effects).toEqual(["open", "settleThread"]);
-    const url = new URL(state.openExternal.mock.calls[0]![0]);
-    expect(url.searchParams.get("description")).toBe("Thread");
-    expect(url.searchParams.has("minutesSpent")).toBe(false);
+    expect(state.openBridge).toHaveBeenCalledOnce();
   });
 
   it("does not settle if opening Bridge fails", async () => {
     state.granted.add("secondary");
     state.show.mockResolvedValue("settle-bridge");
-    state.openExternal.mockRejectedValueOnce(new Error("unavailable"));
+    state.openBridge.mockRejectedValueOnce(new Error("unavailable"));
     createMenu().openMenu(position);
     await state.completed.promise;
     expect(state.effects).toEqual([]);

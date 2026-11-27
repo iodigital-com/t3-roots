@@ -26,7 +26,7 @@ import {
 import { titleRegenerationToast } from "../components/threadTitleRegenerationToast";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { copyThreadReference } from "../lib/copyThreadReference";
-import { bridgeIssueForAction, bridgeWorklogUrl } from "../lib/bridgeWorklog";
+import { useBridgeWorklog } from "./useBridgeWorklog";
 import { m } from "../i18n/messages";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { threadEnvironment } from "../state/threads";
@@ -97,6 +97,7 @@ export function useThreadActionMenu(input: {
     reportFailure: false,
   });
   const handleNewThread = useNewThreadHandler();
+  const openBridge = useBridgeWorklog();
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
   const timestampFormat = useClientSettings((s) => s.timestampFormat);
@@ -146,7 +147,6 @@ export function useThreadActionMenu(input: {
         projectFilter: null,
         isPinned: thread.pinnedAt != null,
         isSettled: supports.settlement && thread.settledOverride === "settled",
-        issues: thread.issues,
         autoSettleEnabled: thread.autoSettleDisabledAt == null,
         isSnoozed: supports.snooze && effectiveSnoozed(thread, { now: now.toISOString() }),
         canSnoozeNow: canSnooze(thread, { now: now.toISOString() }),
@@ -187,13 +187,18 @@ export function useThreadActionMenu(input: {
         }
         return;
       }
-      if (action === "settle-bridge" || action.startsWith("settle-bridge:")) {
-        const issue = bridgeIssueForAction(thread.issues, action);
-        if (issue === undefined) return;
+      if (action === "settle-bridge") {
         try {
-          await api.shell.openExternal(
-            bridgeWorklogUrl({ issue, title: thread.title, now: new Date() }),
-          );
+          if (
+            !(await openBridge({
+              api,
+              threadRef,
+              title: thread.title,
+              links: thread.issues,
+              position,
+            }))
+          )
+            return;
         } catch (error) {
           failureToast(m(msg("Unable to open link.")), error);
           return;
