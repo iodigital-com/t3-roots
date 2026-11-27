@@ -633,6 +633,20 @@ export interface AcpAdapterV2Flavor {
    * tool ends. With `deferFinalizeForBackgroundWork`, the turn stays open until then.
    */
   readonly toolOutlivesPrompt?: (toolCall: AcpToolCallState) => boolean;
+  /** Resolve native task ids to their originating tool calls, when the provider records them. */
+  readonly matchBackgroundTaskIds?: (
+    sessionId: string,
+    taskIds: ReadonlyArray<string>,
+  ) => Effect.Effect<ReadonlyArray<{ readonly taskId: string; readonly toolCallId: string }>>;
+  readonly watchBackgroundReply?: (
+    sessionId: string,
+  ) => Effect.Effect<
+    (
+      reply: string,
+      toolCallId?: string,
+      consumed?: boolean,
+    ) => Effect.Effect<AcpBackgroundReplyState>
+  >;
   readonly isProviderWakeNotification?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => boolean;
@@ -777,6 +791,7 @@ export interface AcpAdapterV2Options {
   };
   readonly testHooks?: {
     readonly onDeferredFinalizeScheduled?: (debounce: Duration.Input) => Effect.Effect<void>;
+    readonly onBackgroundReplyChecked?: (state: AcpBackgroundReplyState) => Effect.Effect<void>;
     /** `cancelAfterPromptStarts`: Stop is holding `session/cancel` until the prompt starts. */
     readonly onCancelHeld?: () => Effect.Effect<void>;
     readonly afterPromptWireSettled?: () => Effect.Effect<void>;
@@ -798,6 +813,8 @@ export interface AcpAdapterV2Options {
     }) => Effect.Effect<void>;
   };
 }
+
+export type AcpBackgroundReplyState = "running" | "completed" | "unknown";
 
 export const AcpProviderCapabilitiesV2 = {
   sessions: {
@@ -1680,6 +1697,18 @@ interface ActiveAcpTurn {
   readonly promptStarted: Deferred.Deferred<void, never>;
   promptUsage: EffectAcpSchema.Usage | undefined;
   backgroundFinalizeGeneration: number;
+  readonly releasedOutlivingToolIds: Set<string>;
+  backgroundReplyFinished:
+    | ((
+        reply: string,
+        toolCallId?: string,
+        consumed?: boolean,
+      ) => Effect.Effect<AcpBackgroundReplyState>)
+    | undefined;
+  backgroundReplyToolCallId: string | undefined;
+  backgroundReplyTextSeen: boolean;
+  backgroundReplySawRunning: boolean;
+  backgroundReplyProgressAt: number;
   /** `replyEndsWithUsageUpdate`: output arrived and its closing `usage_update` has not. */
   replyOpen: boolean;
   /** The agent's own id for this turn's prompt, from `forkFromTurn.nativeTurnId`. */
@@ -2554,6 +2583,28 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         const stoppedRunQuarantine = yield* Ref.make(false);
         // Native subagents can outlive interrupts; carry lineage forward to finish their original turn items.
         const carryoverSubagents = yield* Ref.make<AcpCarryoverSubagents | null>(null);
+        const carryoverOutlivingTools = yield* Ref.make<{
+          readonly sessionId: string;
+          readonly providerTurnId: ActiveAcpTurn["providerTurnId"];
+          readonly tools: Map<string, AcpToolCallState>;
+          readonly released: Set<string>;
+        } | null>(null);
+        const backgroundReplyWatch = yield* Ref.make<{
+          readonly sessionId: string;
+          readonly check: (
+            reply: string,
+            toolCallId?: string,
+            consumed?: boolean,
+          ) => Effect.Effect<AcpBackgroundReplyState>;
+          readonly outlivingTools: ReadonlyMap<string, AcpToolCallState>;
+        } | null>(null);
+        const watchedOutlivingTools = (context: ActiveAcpTurn) =>
+          new Map(
+            [...context.tools].filter(
+              ([, tool]) =>
+                toolStatus(tool.status) === "running" && flavor.toolOutlivesPrompt?.(tool) === true,
+            ),
+          );
         const handledBackgroundTaskIdsInActiveTurn = yield* Ref.make<ReadonlySet<string>>(
           new Set(),
         );
@@ -2700,6 +2751,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             runtimeGeneration,
             Effect.gen(function* () {
               yield* Ref.set(runtimeRestartRequired, true);
+              yield* Ref.set(carryoverOutlivingTools, null);
+              yield* Ref.set(backgroundReplyWatch, null);
               if (!followsAgentWorkState) {
                 // An open prompt fails with its transport. A turn held open for a running tool
                 // has no prompt, so nothing else ends it.
@@ -2709,7 +2762,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   held === null ||
                   !held.promptSettled ||
                   held.finalized ||
-                  !hasDeferredBackgroundWork(held)
+                  !defersFinalizeForBackgroundWork
                 )
                   return;
                 for (const tool of held.tools.values()) {
@@ -4206,7 +4259,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (flavor.toolOutlivesPrompt !== undefined) {
             // A tool that never started has nothing to report later.
             for (const tool of context.tools.values()) {
-              if (toolStatus(tool.status) === "running" && flavor.toolOutlivesPrompt(tool))
+              if (
+                toolStatus(tool.status) === "running" &&
+                !context.releasedOutlivingToolIds.has(tool.toolCallId) &&
+                flavor.toolOutlivesPrompt(tool)
+              )
                 return true;
             }
           }
@@ -5592,7 +5649,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           if (context !== null) yield* settleIdleWork(context);
                           if (context !== null && flavor.wakeOnDetachedRequest) {
                             // The agent goes on with its reply once the request is answered.
-                            if (flavor.replyEndsWithUsageUpdate === true) context.replyOpen = true;
+                            if (flavor.replyEndsWithUsageUpdate === true) {
+                              context.replyOpen = true;
+                              context.backgroundReplyProgressAt = yield* Clock.currentTimeMillis;
+                            }
                             yield* rearmDeferredFinalize(context);
                           }
                         }),
@@ -5626,10 +5686,33 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             } else if (context.nativeThreadId === notification.sessionId) {
               if (update.sessionUpdate === "usage_update") {
                 context.replyOpen = false;
-                if (context.promptSettled) yield* idleReportedSubagents(context);
+                context.backgroundReplySawRunning = false;
+                if (
+                  context.backgroundReplyTextSeen &&
+                  context.backgroundReplyFinished !== undefined
+                ) {
+                  // Advance only over this finished reply, including buffered continuation output.
+                  yield* context.backgroundReplyFinished(
+                    context.assistant.current?.text ?? "",
+                    context.backgroundReplyToolCallId,
+                    true,
+                  );
+                  context.backgroundReplyToolCallId = undefined;
+                  context.backgroundReplyTextSeen = false;
+                }
+                if (context.promptSettled) {
+                  yield* idleReportedSubagents(context);
+                }
                 yield* rearmDeferredFinalize(context);
               } else if (acpRootSessionUpdateIngestsOutput(notification)) {
                 context.replyOpen = true;
+                context.backgroundReplyProgressAt = yield* Clock.currentTimeMillis;
+                if (
+                  (context.promptSettled || context.input.message.createdBy === "agent") &&
+                  update.sessionUpdate === "agent_message_chunk"
+                ) {
+                  context.backgroundReplyTextSeen = true;
+                }
               }
             }
           }
@@ -5761,6 +5844,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             return;
           }
           if (context === null) {
+            const survivingTools = yield* Ref.get(carryoverOutlivingTools);
+            if (
+              survivingTools?.sessionId === notification.sessionId &&
+              (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
+            ) {
+              for (const event of parseSessionUpdateEvent(notification).events) {
+                if (
+                  event._tag !== "ToolCallUpdated" ||
+                  !survivingTools.tools.has(event.toolCall.toolCallId)
+                )
+                  continue;
+                if (
+                  toolStatus(event.toolCall.status) === "completed" ||
+                  toolStatus(event.toolCall.status) === "failed"
+                )
+                  survivingTools.tools.delete(event.toolCall.toolCallId);
+              }
+            }
             if (yield* Ref.get(stoppedRunQuarantine)) {
               return;
             }
@@ -6214,6 +6315,48 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               for (const event of parsed.events) {
                 if (event._tag === "ToolCallUpdated") {
                   yield* emitTool(context, event.toolCall, undefined, event.rawPayload);
+                  const finishedTool = context.tools.get(event.toolCall.toolCallId);
+                  const previousWatch = yield* Ref.get(backgroundReplyWatch);
+                  const previousTool =
+                    previousWatch?.sessionId === context.nativeThreadId
+                      ? previousWatch.outlivingTools.get(event.toolCall.toolCallId)
+                      : undefined;
+                  if (
+                    previousWatch?.sessionId === context.nativeThreadId &&
+                    finishedTool !== undefined &&
+                    toolStatus(finishedTool.status) === "running" &&
+                    flavor.toolOutlivesPrompt?.(finishedTool) === true
+                  ) {
+                    const outlivingTools = new Map(previousWatch.outlivingTools);
+                    outlivingTools.set(finishedTool.toolCallId, finishedTool);
+                    yield* Ref.set(backgroundReplyWatch, { ...previousWatch, outlivingTools });
+                  }
+                  if (
+                    (context.promptSettled ||
+                      acpIsProviderContinuationMessage(context.input.message)) &&
+                    flavor.watchBackgroundReply !== undefined &&
+                    finishedTool !== undefined &&
+                    toolStatus(finishedTool.status) === "completed" &&
+                    (flavor.toolOutlivesPrompt?.(finishedTool) === true ||
+                      (previousTool !== undefined &&
+                        flavor.toolOutlivesPrompt?.(previousTool) === true))
+                  ) {
+                    context.backgroundReplyFinished ??= yield* flavor.watchBackgroundReply(
+                      context.nativeThreadId,
+                    );
+                    const outlivingTools = new Map(
+                      previousWatch?.sessionId === context.nativeThreadId
+                        ? previousWatch.outlivingTools
+                        : [],
+                    );
+                    outlivingTools.delete(finishedTool.toolCallId);
+                    yield* Ref.set(backgroundReplyWatch, {
+                      sessionId: context.nativeThreadId,
+                      check: context.backgroundReplyFinished,
+                      outlivingTools,
+                    });
+                    context.backgroundReplyToolCallId = finishedTool.toolCallId;
+                  }
                 } else if (event._tag === "PlanUpdated") {
                   yield* emitPlan(context, event.payload, update.sessionUpdate !== "plan");
                 } else if (event._tag === "NoticeReceived") {
@@ -8467,6 +8610,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               yield* Ref.set(detachedBackgroundCommands, new Map());
               yield* Ref.set(midTurnUnreportedCompletedTaskIds, new Set());
               yield* Ref.set(carryoverSubagents, null);
+              yield* Ref.set(carryoverOutlivingTools, null);
+              yield* Ref.set(backgroundReplyWatch, null);
               yield* Ref.set(lastTurnRoute, null);
             }),
           );
@@ -8483,16 +8628,38 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         ): Effect.fn.Return<void> {
           if (context.finalized) return;
           const settledStatus = context.interrupted ? "interrupted" : status;
-          const threadDisposition = options?.threadDisposition ?? "reusable";
           context.finalizedStatus = settledStatus;
           context.finalized = true;
+          if (
+            settledStatus === "completed" &&
+            context.backgroundReplyTextSeen &&
+            flavor.watchBackgroundReply !== undefined
+          ) {
+            const check = yield* flavor.watchBackgroundReply(context.nativeThreadId);
+            const previousWatch = yield* Ref.get(backgroundReplyWatch);
+            const outlivingTools = new Map(
+              previousWatch?.sessionId === context.nativeThreadId
+                ? previousWatch.outlivingTools
+                : [],
+            );
+            for (const [id, tool] of watchedOutlivingTools(context)) outlivingTools.set(id, tool);
+            yield* Ref.set(backgroundReplyWatch, {
+              sessionId: context.nativeThreadId,
+              check,
+              outlivingTools,
+            });
+          }
+          const threadDisposition = options?.threadDisposition ?? "reusable";
           const watchdog = context.inactivityWatchdog;
           context.inactivityWatchdog = undefined;
           if (watchdog !== undefined) {
             yield* Fiber.interrupt(watchdog).pipe(Effect.forkDetach, Effect.asVoid);
           }
           const directStopQuarantine = yield* Ref.get(stoppedRunQuarantine);
-          if (flavor.subagentsIdleOnTurnCompletion === true) {
+          if (
+            flavor.subagentsIdleOnTurnCompletion === true &&
+            !(settledStatus === "interrupted" && options?.childTurnsContinue === true)
+          ) {
             for (const subagent of context.subagents.values()) {
               if (!acpSubagentStatusBlocksTurnSettlement(subagent.task.status)) continue;
               yield* emitSubagent(context, {
@@ -8600,9 +8767,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           });
           const rootSessionId = yield* Ref.get(activeSessionId);
           const childTurnsContinue =
-            settledStatus === "failed" &&
+            (settledStatus === "failed" || settledStatus === "interrupted") &&
             (options?.childTurnsContinue === true ||
-              (followsAgentWorkState &&
+              (settledStatus === "failed" &&
+                followsAgentWorkState &&
                 rootSessionId !== null &&
                 hasWorkingDescendant(rootSessionId)));
           yield* emitProviderEvent(
@@ -8636,6 +8804,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   runOrdinal: context.input.runOrdinal,
                   status: settledStatus,
                   failure: null,
+                  ...(childTurnsContinue ? { childTurnsContinue: true } : {}),
                   threadDisposition,
                 },
           );
@@ -8683,9 +8852,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (hasDeferredBackgroundWork(context)) return;
           context.backgroundFinalizeGeneration += 1;
           const generation = context.backgroundFinalizeGeneration;
-          const debounce = context.replyOpen
-            ? ACP_OPEN_REPLY_QUIET_LIMIT
-            : ACP_DEFERRED_FINALIZE_DEBOUNCE;
+          const debounce =
+            context.replyOpen && context.backgroundReplyFinished === undefined
+              ? ACP_OPEN_REPLY_QUIET_LIMIT
+              : ACP_DEFERRED_FINALIZE_DEBOUNCE;
           yield* Effect.gen(function* () {
             yield* Effect.sleep(debounce);
             if (
@@ -8696,6 +8866,33 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               return;
             }
             if (hasDeferredBackgroundWork(context)) return;
+            if (context.replyOpen && context.backgroundReplyFinished !== undefined) {
+              const state = yield* context.backgroundReplyFinished(
+                context.assistant.current?.text ?? "",
+                context.backgroundReplyToolCallId,
+              );
+              const now = yield* Clock.currentTimeMillis;
+              yield* options.testHooks?.onBackgroundReplyChecked?.(state) ?? Effect.void;
+              if (
+                context.finalized ||
+                context.interrupted ||
+                context.backgroundFinalizeGeneration !== generation ||
+                hasDeferredBackgroundWork(context)
+              )
+                return;
+              if (state === "running") context.backgroundReplySawRunning = true;
+              if (
+                state === "running" ||
+                (state === "unknown" &&
+                  (context.backgroundReplySawRunning ||
+                    now - context.backgroundReplyProgressAt <
+                      Duration.toMillis(ACP_OPEN_REPLY_QUIET_LIMIT)))
+              ) {
+                // Keep checking: a native reply can finish without another ACP chunk.
+                yield* scheduleDeferredFinalize(context);
+                return;
+              }
+            }
             const status = context.promptSettledStatus ?? "completed";
             yield* finalizeTurn(context, status);
           }).pipe(Effect.forkIn(sessionScope), Effect.asVoid);
@@ -9062,6 +9259,18 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                           : "cancelled"
                         : "completed";
                   if (defersFinalizeForBackgroundWork && !context.interrupted) {
+                    if (flavor.watchBackgroundReply !== undefined) {
+                      context.backgroundReplyFinished = yield* flavor.watchBackgroundReply(
+                        context.nativeThreadId,
+                      );
+                      yield* Ref.set(backgroundReplyWatch, {
+                        sessionId: context.nativeThreadId,
+                        check: context.backgroundReplyFinished,
+                        outlivingTools: watchedOutlivingTools(context),
+                      });
+                      context.backgroundReplyTextSeen = false;
+                      context.backgroundReplySawRunning = false;
+                    }
                     context.promptSettled = true;
                     context.promptSettledStatus = status;
                     for (const [taskId, completion] of context.backgroundCommands) {
@@ -9282,6 +9491,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 new Map(current).set(requestedSessionId, initialNativeMetadata),
               );
             }
+            const previousReplyWatch = yield* Ref.get(backgroundReplyWatch);
             const context: ActiveAcpTurn = {
               input: turnInput,
               providerTurnId,
@@ -9327,101 +9537,114 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               promptStarted,
               promptUsage: undefined,
               backgroundFinalizeGeneration: 0,
+              releasedOutlivingToolIds: new Set(),
+              backgroundReplyFinished:
+                isContinuationTurn && previousReplyWatch?.sessionId === requestedSessionId
+                  ? previousReplyWatch.check
+                  : undefined,
+              backgroundReplyToolCallId: undefined,
+              backgroundReplyTextSeen: false,
+              backgroundReplySawRunning: false,
+              backgroundReplyProgressAt: yield* Clock.currentTimeMillis,
               replyOpen: false,
               nativePromptId: undefined,
               lastProgressAt: 0,
               inactivityWatchdog: undefined,
             };
-            const carryover = yield* Ref.getAndSet(carryoverSubagents, null);
-            let rehydratedCarryoverSubagents: ReadonlyArray<ActiveAcpSubagent> = [];
-            if (carryover !== null && carryover.sessionId === requestedSessionId) {
-              rehydratedCarryoverSubagents = carryover.subagents;
-              for (const subagent of carryover.subagents) {
-                const nativeId = subagent.task.nativeTaskRef?.nativeId ?? null;
-                if (nativeId !== null) {
-                  context.subagents.set(nativeId, subagent);
-                }
-                if (subagent.childSessionId !== null) {
-                  context.subagentsBySessionId.set(subagent.childSessionId, subagent);
+            const attachAndReplay = Effect.gen(function* () {
+              let rehydratedCarryoverSubagents: ReadonlyArray<ActiveAcpSubagent> = [];
+              const survivingTools = yield* Ref.getAndSet(carryoverOutlivingTools, null);
+              if (survivingTools?.sessionId === requestedSessionId) {
+                for (const [id, tool] of survivingTools.tools) context.tools.set(id, tool);
+                for (const id of survivingTools.released) context.releasedOutlivingToolIds.add(id);
+              }
+              const carryover = yield* Ref.getAndSet(carryoverSubagents, null);
+              if (carryover !== null && carryover.sessionId === requestedSessionId) {
+                rehydratedCarryoverSubagents = carryover.subagents;
+                for (const subagent of carryover.subagents) {
+                  const nativeId = subagent.task.nativeTaskRef?.nativeId ?? null;
+                  if (nativeId !== null) {
+                    context.subagents.set(nativeId, subagent);
+                  }
+                  if (subagent.childSessionId !== null) {
+                    context.subagentsBySessionId.set(subagent.childSessionId, subagent);
+                  }
                 }
               }
-            }
-            yield* Ref.set(activeTurn, context);
-            yield* Ref.set(stoppedRunQuarantine, false);
-            const runningTurn = providerTurnPayload(context, "running", null);
-            yield* Ref.update(providerTurns, (current) => {
-              const updated = new Map(current);
-              updated.set(String(runningTurn.id), runningTurn);
-              return updated;
-            });
-            yield* emitProviderEvent({
-              type: "provider_turn.updated",
-              driver,
-              threadId: turnInput.threadId,
-              providerTurn: runningTurn,
-            });
-            const activeProviderThread: OrchestrationV2ProviderThread = {
-              ...turnInput.providerThread,
-              providerSessionId: input.providerSessionId,
-              status: "active",
-              contextUsage: context.contextUsage,
-              nativeMetadata: context.nativeMetadata,
-              updatedAt: startedAt,
-            };
-            yield* Ref.update(providerThreadByNativeSessionId, (current) =>
-              new Map(current).set(requestedSessionId, activeProviderThread),
-            );
-            yield* emitProviderEvent({
-              type: "provider_thread.updated",
-              driver,
-              providerThread: activeProviderThread,
-            });
-            yield* rememberSnapshotMessage({
-              createdBy: turnInput.message.createdBy,
-              creationSource: turnInput.message.creationSource,
-              ...(turnInput.message.scheduledTaskId === undefined
-                ? {}
-                : { scheduledTaskId: turnInput.message.scheduledTaskId }),
-              ...(turnInput.message.senderThreadId === undefined
-                ? {}
-                : { senderThreadId: turnInput.message.senderThreadId }),
-              id: turnInput.message.messageId,
-              threadId: turnInput.threadId,
-              runId: turnInput.runId,
-              nodeId: turnInput.rootNodeId,
-              role: "user",
-              text: turnInput.message.text,
-              attachments: [...turnInput.message.attachments],
-              streaming: false,
-              createdAt: startedAt,
-              updatedAt: startedAt,
-            });
-            if (followsAgentWorkState)
-              yield* runtimeCallbackPermit.withPermit(syncNativeChildren(context));
-            const attached = turnAttached;
-            turnAttached = yield* Deferred.make<boolean>();
-            yield* Deferred.succeed(attached, true);
-            // Every attach ends the deferred-terminal contract, but only the
-            // queued provider continuation owns wake traffic. A user turn may
-            // start before that continuation and must leave its buffer intact.
-            yield* projectDeferredCarryoverTerminals(rehydratedCarryoverSubagents);
-            // Retain projected terminals during wake drain so monotonic guards reject replayed spawns.
-            if (isContinuationTurn) {
-              yield* Ref.set(continuationRequested, false);
-              yield* Ref.update(wakeReports, ({ reports, offered }) => ({
-                reports: new Map([...reports].filter(([key]) => !offered.has(key))),
-                offered: noWakeReports.offered,
-              }));
-              const takeWakeBuffer = Ref.modify(wakeBuffer, (current) => {
-                const next: Array<EffectAcpSchema.SessionNotification> = [];
-                return [
-                  current.filter((notification) => notification.sessionId === requestedSessionId),
-                  next,
-                ] as const;
+              yield* Ref.set(activeTurn, context);
+              yield* Ref.set(stoppedRunQuarantine, false);
+              const runningTurn = providerTurnPayload(context, "running", null);
+              yield* Ref.update(providerTurns, (current) => {
+                const updated = new Map(current);
+                updated.set(String(runningTurn.id), runningTurn);
+                return updated;
               });
-              if (followsAgentWorkState) {
-                yield* runtimeCallbackPermit.withPermit(
-                  Effect.gen(function* () {
+              yield* emitProviderEvent({
+                type: "provider_turn.updated",
+                driver,
+                threadId: turnInput.threadId,
+                providerTurn: runningTurn,
+              });
+              const activeProviderThread: OrchestrationV2ProviderThread = {
+                ...turnInput.providerThread,
+                providerSessionId: input.providerSessionId,
+                status: "active",
+                contextUsage: context.contextUsage,
+                nativeMetadata: context.nativeMetadata,
+                updatedAt: startedAt,
+              };
+              yield* Ref.update(providerThreadByNativeSessionId, (current) =>
+                new Map(current).set(requestedSessionId, activeProviderThread),
+              );
+              yield* emitProviderEvent({
+                type: "provider_thread.updated",
+                driver,
+                providerThread: activeProviderThread,
+              });
+              yield* rememberSnapshotMessage({
+                createdBy: turnInput.message.createdBy,
+                creationSource: turnInput.message.creationSource,
+                ...(turnInput.message.scheduledTaskId === undefined
+                  ? {}
+                  : { scheduledTaskId: turnInput.message.scheduledTaskId }),
+                ...(turnInput.message.senderThreadId === undefined
+                  ? {}
+                  : { senderThreadId: turnInput.message.senderThreadId }),
+                id: turnInput.message.messageId,
+                threadId: turnInput.threadId,
+                runId: turnInput.runId,
+                nodeId: turnInput.rootNodeId,
+                role: "user",
+                text: turnInput.message.text,
+                attachments: [...turnInput.message.attachments],
+                streaming: false,
+                createdAt: startedAt,
+                updatedAt: startedAt,
+              });
+              if (followsAgentWorkState) yield* syncNativeChildren(context);
+              const attached = turnAttached;
+              turnAttached = yield* Deferred.make<boolean>();
+              yield* Deferred.succeed(attached, true);
+              // Every attach ends the deferred-terminal contract, but only the
+              // queued provider continuation owns wake traffic. A user turn may
+              // start before that continuation and must leave its buffer intact.
+              yield* projectDeferredCarryoverTerminals(rehydratedCarryoverSubagents);
+              // Retain projected terminals during wake drain so monotonic guards reject replayed spawns.
+              if (isContinuationTurn) {
+                yield* Ref.set(continuationRequested, false);
+                yield* Ref.update(wakeReports, ({ reports, offered }) => ({
+                  reports: new Map([...reports].filter(([key]) => !offered.has(key))),
+                  offered: noWakeReports.offered,
+                }));
+                const takeWakeBuffer = Ref.modify(wakeBuffer, (current) => {
+                  const next: Array<EffectAcpSchema.SessionNotification> = [];
+                  return [
+                    current.filter((notification) => notification.sessionId === requestedSessionId),
+                    next,
+                  ] as const;
+                });
+                if (followsAgentWorkState) {
+                  yield* Effect.gen(function* () {
                     const liveWork = agentWork;
                     yield* Effect.forEach(yield* takeWakeBuffer, handleSessionUpdate, {
                       discard: true,
@@ -9429,55 +9652,55 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     agentWork = liveWork;
                     context.workAccepted = true;
                     yield* settleIdleWork(context);
-                  }),
+                  });
+                  return;
+                }
+                const drainedWakeCount = yield* takeWakeBuffer.pipe(
+                  Effect.tap((drained) =>
+                    Effect.forEach(drained, handleSessionUpdate, {
+                      concurrency: 1,
+                      discard: true,
+                    }),
+                  ),
+                  Effect.map((drained) => drained.length),
                 );
-                return;
-              }
-              const drainedWakeCount = yield* takeWakeBuffer.pipe(
-                Effect.tap((drained) =>
-                  Effect.forEach(drained, handleSessionUpdate, {
-                    concurrency: 1,
-                    discard: true,
-                  }),
-                ),
-                Effect.map((drained) => drained.length),
-              );
-              // A root woken after foreground idle ends on its next idle report.
-              if (drainedWakeCount > 0 && rootForegroundWork !== undefined) {
-                yield* runtimeCallbackPermit.withPermit(
-                  Effect.suspend(() => {
+                // A root woken after foreground idle ends on its next idle report.
+                if (drainedWakeCount > 0 && rootForegroundWork !== undefined) {
+                  yield* Effect.suspend(() => {
                     if (rootForegroundWork === "idle") return finalizeTurn(context, "completed");
                     context.workAccepted = true;
                     return Effect.void;
-                  }),
-                );
-                return;
-              }
-              context.promptSettled = true;
-              context.promptSettledStatus = "completed";
-              // The replayed reply ended before the prompt counted as settled.
-              yield* idleReportedSubagents(context);
-              if (drainedWakeCount === 0) {
-                if (continuationWasRequested && defersFinalizeForBackgroundWork) {
+                  });
+                  return;
+                }
+                context.promptSettled = true;
+                context.promptSettledStatus = "completed";
+                // The replayed reply ended before the prompt counted as settled.
+                yield* idleReportedSubagents(context);
+                if (drainedWakeCount === 0) {
+                  if (continuationWasRequested && defersFinalizeForBackgroundWork) {
+                    if (hasDeferredBackgroundWork(context)) {
+                      yield* rearmDeferredFinalize(context);
+                    } else {
+                      yield* scheduleDeferredFinalize(context);
+                    }
+                  } else {
+                    yield* finalizeTurn(context, "completed");
+                  }
+                  return;
+                }
+                if (!context.finalized) {
                   if (hasDeferredBackgroundWork(context)) {
                     yield* rearmDeferredFinalize(context);
                   } else {
                     yield* scheduleDeferredFinalize(context);
                   }
-                } else {
-                  yield* finalizeTurn(context, "completed");
                 }
                 return;
               }
-              if (!context.finalized) {
-                if (hasDeferredBackgroundWork(context)) {
-                  yield* rearmDeferredFinalize(context);
-                } else {
-                  yield* scheduleDeferredFinalize(context);
-                }
-              }
-              return;
-            }
+            });
+            yield* runtimeCallbackPermit.withPermit(attachAndReplay);
+            if (isContinuationTurn) return;
             const checkPromptOutcome =
               flavor.watchPromptOutcome === undefined
                 ? undefined
@@ -9990,27 +10213,44 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 ),
               ),
           ),
-          // The held turn already waits on these commands; their tool calls carry no task id,
-          // so any id matches while one runs on this thread.
-          ...(flavor.toolOutlivesPrompt === undefined
+          ...(flavor.toolOutlivesPrompt === undefined || flavor.matchBackgroundTaskIds === undefined
             ? {}
             : {
                 awaitBackgroundTasks: Effect.fn("AcpAdapterV2.awaitBackgroundTasks")(function* ({
                   providerThread,
                   taskIds,
+                  awaited,
                 }) {
                   const outlives = flavor.toolOutlivesPrompt;
+                  const match = flavor.matchBackgroundTaskIds;
                   const context = yield* Ref.get(activeTurn);
-                  const holdsCommand =
-                    outlives !== undefined &&
-                    defersFinalizeForBackgroundWork &&
-                    context !== null &&
-                    !context.finalized &&
-                    context.nativeThreadId === providerThread.nativeThreadRef?.nativeId &&
-                    [...context.tools.values()].some(
-                      (tool) => toolStatus(tool.status) === "running" && outlives(tool),
-                    );
-                  return { matched: holdsCommand ? [...new Set(taskIds)] : [] };
+                  if (
+                    outlives === undefined ||
+                    match === undefined ||
+                    !defersFinalizeForBackgroundWork ||
+                    context === null ||
+                    context.finalized ||
+                    context.nativeThreadId !== providerThread.nativeThreadRef?.nativeId
+                  )
+                    return { matched: [] };
+                  const resolved = yield* match(context.nativeThreadId, taskIds);
+                  if ((yield* Ref.get(activeTurn)) !== context || context.finalized)
+                    return { matched: [] };
+                  const matched: Array<string> = [];
+                  for (const { taskId, toolCallId } of resolved) {
+                    const tool = context.tools.get(toolCallId);
+                    if (
+                      tool === undefined ||
+                      toolStatus(tool.status) !== "running" ||
+                      !outlives(tool)
+                    )
+                      continue;
+                    if (awaited) context.releasedOutlivingToolIds.delete(toolCallId);
+                    else context.releasedOutlivingToolIds.add(toolCallId);
+                    matched.push(taskId);
+                  }
+                  yield* rearmDeferredFinalize(context);
+                  return { matched };
                 }),
               }),
           interruptTurn: Effect.fn("AcpAdapterV2.interruptTurn")(
@@ -10120,6 +10360,24 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       }
                       const context = interruptContext;
                       if (context?.providerTurnId !== turnInput.providerTurnId) {
+                        const survivingTools = yield* Ref.get(carryoverOutlivingTools);
+                        const survivingChildren = yield* Ref.get(carryoverSubagents);
+                        if (
+                          context === null &&
+                          !hardRestart &&
+                          turnInput.requestRuntimeRestart === true &&
+                          flavor.preserveRuntimeOnSettledInterrupt === true &&
+                          (survivingTools?.providerTurnId === turnInput.providerTurnId ||
+                            survivingChildren?.subagents.some(
+                              (child) => child.providerTurnId === turnInput.providerTurnId,
+                            ) === true)
+                        ) {
+                          yield* quarantineStoppedRun();
+                          yield* cancelPendingRuntimeRequests();
+                          yield* terminalizeCarryoverSubagents(survivingChildren);
+                          yield* runtime.cancel;
+                          return undefined;
+                        }
                         // Contain orphan runtimes on Stop; session-wide teardown must not touch another active turn.
                         const containOrphanRuntime =
                           context === null &&
@@ -10248,11 +10506,34 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       }
                       // A settled soft interrupt keeps background subagents, and with them their MCP calls.
                       yield* cancelPendingRuntimeRequests({ stopMcpCalls: !settledSoftInterrupt });
-                      // Finalize before killing so projection catches up and concurrent interrupts see activeTurn cleared.
-                      if (
-                        (hardRestart || context.promptSettled || settledSoftInterrupt) &&
-                        !context.finalized
-                      ) {
+                      if (settledSoftInterrupt) {
+                        // No native terminal can land between copying live tools and clearing this turn.
+                        yield* runtimeCallbackPermit.withPermit(
+                          Effect.gen(function* () {
+                            if (context.finalized) return;
+                            const outlives = flavor.toolOutlivesPrompt;
+                            if (outlives !== undefined) {
+                              const tools = new Map(
+                                [...context.tools].filter(
+                                  ([, tool]) =>
+                                    toolStatus(tool.status) === "running" && outlives(tool),
+                                ),
+                              );
+                              if (tools.size > 0)
+                                yield* Ref.set(carryoverOutlivingTools, {
+                                  sessionId: context.nativeThreadId,
+                                  providerTurnId: context.providerTurnId,
+                                  tools,
+                                  released: new Set(context.releasedOutlivingToolIds),
+                                });
+                            }
+                            yield* finalizeTurn(context, "interrupted", undefined, {
+                              childTurnsContinue: true,
+                            });
+                          }),
+                        );
+                      } else if ((hardRestart || context.promptSettled) && !context.finalized) {
+                        // Finalize before killing so projection catches up and concurrent interrupts see activeTurn cleared.
                         yield* finalizeTurn(context, "interrupted");
                       }
                       if (hardRestart) {

@@ -41,6 +41,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { CodexAppServerRequestError } from "effect-codex-app-server/errors";
@@ -63,6 +64,8 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import * as RunFinalizationService from "./RunFinalizationService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
+
+const decodeProviderEvent = Schema.decodeUnknownSync(ProviderAdapter.ProviderAdapterV2Event);
 
 const mockEventSink = (implementation: Partial<EventSink.EventSinkV2["Service"]>) =>
   Layer.mock(EventSink.EventSinkV2)({
@@ -4376,7 +4379,7 @@ function backgroundTurnItemEventForRun(
 
 function subagentEvent(
   ids: BackgroundScenarioIds,
-  status: "running" | "completed" | "idle",
+  status: "running" | "completed" | "idle" | "interrupted",
 ): ProviderAdapter.ProviderAdapterV2Event {
   return {
     type: "subagent.updated",
@@ -4796,52 +4799,82 @@ function runBackgroundItemScenario(
   });
 }
 
-it.effect("keeps a failed root's still-running native children live while the run settles", () =>
-  Effect.gen(function* () {
-    const finalized = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
-    const childTurn = (
-      ids: BackgroundScenarioIds,
-      status: "running" | "completed",
-    ): ProviderAdapter.ProviderAdapterV2Event =>
-      ({
-        type: "provider_turn.updated",
-        driver,
-        threadId: ids.childThreadId,
-        providerTurn: {
-          id: ProviderTurnId.make(`${ids.rootProviderTurnId}:child`),
-          providerThreadId: ProviderThreadId.make(`${ids.providerThreadId}:child`),
-          nodeId: NodeId.make(`${ids.subagentNodeId}:child-root`),
-          runAttemptId: null,
-          status,
+it.effect.each([
+  { status: "failed", childStatus: "completed" },
+  { status: "interrupted", childStatus: "completed" },
+  { status: "interrupted", childStatus: "interrupted" },
+] as const)(
+  "ingests a $childStatus child after its $status root continues children",
+  ({ status, childStatus }) =>
+    Effect.gen(function* () {
+      const finalized = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
+      const childResult = yield* Ref.make<string | null>(null);
+      const childTurn = (
+        ids: BackgroundScenarioIds,
+        status: "running" | "completed" | "interrupted",
+      ): ProviderAdapter.ProviderAdapterV2Event =>
+        ({
+          type: "provider_turn.updated",
+          driver,
+          threadId: ids.childThreadId,
+          providerTurn: {
+            id: ProviderTurnId.make(`${ids.rootProviderTurnId}:child`),
+            providerThreadId: ProviderThreadId.make(`${ids.providerThreadId}:child`),
+            nodeId: NodeId.make(`${ids.subagentNodeId}:child-root`),
+            runAttemptId: null,
+            status,
+          },
+        }) as ProviderAdapter.ProviderAdapterV2Event;
+      const observed = yield* runBackgroundItemScenario(
+        `${status}-root-live-child-${childStatus}`,
+        (ids) => {
+          const childTerminal = subagentEvent(ids, childStatus);
+          if (childTerminal.type !== "subagent.updated")
+            throw new Error("Expected a subagent event");
+          const terminal = decodeProviderEvent({
+            ...rootTerminalEvent(ids, status),
+            childTurnsContinue: true,
+          });
+          return [
+            childThreadCreatedEvent(ids),
+            subagentEvent(ids, "running"),
+            childTurn(ids, "running"),
+            terminal,
+            {
+              ...childTerminal,
+              subagent: {
+                ...childTerminal.subagent,
+                result: childStatus === "completed" ? "Child result" : null,
+              },
+            },
+            childTurn(ids, childStatus),
+          ];
         },
-      }) as ProviderAdapter.ProviderAdapterV2Event;
-    const observed = yield* runBackgroundItemScenario(
-      "failed-root-live-child",
-      (ids) => [
-        childThreadCreatedEvent(ids),
-        subagentEvent(ids, "running"),
-        childTurn(ids, "running"),
-        { ...rootTerminalEvent(ids, "failed"), childTurnsContinue: true },
-        subagentEvent(ids, "completed"),
-        childTurn(ids, "completed"),
-      ],
-      {
-        keepEventStreamOpen: true,
-        onFinalized: (events) => Ref.set(finalized, events),
-      },
-    );
+        {
+          keepEventStreamOpen: true,
+          onFinalized: (events) => Ref.set(finalized, events),
+          onIngest: (event) =>
+            event.type === "subagent.updated" && event.subagent.status === childStatus
+              ? Ref.set(childResult, event.subagent.result)
+              : Effect.void,
+        },
+      );
 
-    assert.deepEqual(observed, ["subagent:running", "root-finalized", "subagent:completed"]);
-    const written = yield* Ref.get(finalized);
-    assert.deepEqual(
-      written.flatMap((event) => (event.type === "run.updated" ? [event.payload.status] : [])),
-      ["failed"],
-    );
-    assert.isFalse(
-      written.some((event) => event.type === "subagent.updated"),
-      "a child that outlives the failed root must not be settled with it",
-    );
-  }),
+      assert.deepEqual(observed, ["subagent:running", "root-finalized", `subagent:${childStatus}`]);
+      const written = yield* Ref.get(finalized);
+      assert.deepEqual(
+        written.flatMap((event) => (event.type === "run.updated" ? [event.payload.status] : [])),
+        [status],
+      );
+      assert.isFalse(
+        written.some((event) => event.type === "subagent.updated"),
+        "a child that outlives the root must not be settled with it",
+      );
+      assert.equal(
+        yield* Ref.get(childResult),
+        childStatus === "completed" ? "Child result" : null,
+      );
+    }),
 );
 
 it.effect.each([
