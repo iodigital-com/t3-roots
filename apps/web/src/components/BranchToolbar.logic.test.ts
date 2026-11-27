@@ -43,10 +43,16 @@ describe("resolveBranchToolbarPrBranch", () => {
   it("hides PR state while an optimistic branch switch is in flight", () => {
     expect(
       resolveBranchToolbarPrBranch({
-        activeThreadBranch: "feature/current",
+        currentGitBranch: "feature/current",
         resolvedActiveBranch: "feature/next",
       }),
     ).toBeNull();
+    expect(
+      resolveBranchToolbarPrBranch({
+        currentGitBranch: "feature/next",
+        resolvedActiveBranch: "feature/next",
+      }),
+    ).toBe("feature/next");
   });
 });
 

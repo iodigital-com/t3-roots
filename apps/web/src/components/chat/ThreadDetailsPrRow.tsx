@@ -118,11 +118,13 @@ export function ThreadDetailsPrRow({
   const repository = sourceControlClients.repositorySelector(project?.repositoryIdentity);
   const reference: PullRequestRef | null =
     supportsPullRequests && project !== null
-      ? linkedReference
-        ? { ...linkedReference, projectId: project.id as ProjectId }
-        : repository !== null
-          ? { projectId: project.id as ProjectId, repository, number }
-          : null
+      ? linkedReference === null
+        ? null
+        : linkedReference
+          ? { ...linkedReference, projectId: project.id as ProjectId }
+          : repository !== null
+            ? { projectId: project.id as ProjectId, repository, number }
+            : null
       : null;
   const detailAtom =
     reference === null
