@@ -13,6 +13,7 @@ export type ThreadActionMenuId =
   | "pin"
   | "unpin"
   | "settle"
+  | "settle-bridge"
   | "unsettle"
   | "auto-settle"
   | "auto-settle:enabled"
@@ -174,6 +175,15 @@ export function buildThreadActionMenuItems(
                 icon: "circle-check",
               }
             : { id: "settle" as const, label: resolve(msg("Settle thread")), icon: "circle-check" },
+        ]
+      : []),
+    ...(state.supports.settlement && !state.isSettled
+      ? [
+          {
+            id: "settle-bridge" as const,
+            label: resolve(msg("Settle and book hours")),
+            icon: "clock",
+          },
         ]
       : []),
     ...(state.supports.snooze

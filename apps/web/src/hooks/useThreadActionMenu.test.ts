@@ -27,6 +27,10 @@ const state = vi.hoisted(() => ({
       position: { x: number; y: number },
     ) => Promise<ThreadActionMenuId | null>
   >(),
+  openBridge: vi.fn(async (_input: unknown) => {
+    state.effects.push("open");
+    return true;
+  }),
 }));
 
 function recordEffect(action: string) {
@@ -110,6 +114,7 @@ vi.mock("./useCopyToClipboard", () => ({
 vi.mock("./useHandleNewThread", () => ({
   useNewThreadHandler: () => async () => recordEffect("draft"),
 }));
+vi.mock("./useBridgeWorklog", () => ({ useBridgeWorklog: () => state.openBridge }));
 vi.mock("./useSettings", () => ({
   useClientSettings: (select: (settings: unknown) => unknown) =>
     select({
@@ -163,22 +168,31 @@ beforeEach(() => {
   state.effects = [];
   state.completed = deferred<void>();
   state.show.mockReset().mockResolvedValue(null);
+  state.openBridge.mockReset().mockImplementation(async () => {
+    state.effects.push("open");
+    return true;
+  });
 });
 
 describe("thread menu permissions", () => {
-  it.each(["rename", "regenerate-title", "delete", "pin", "settle", "archive"] as const)(
-    "%s rechecks after the native menu closes",
-    async (action) => {
-      state.granted.add("secondary");
-      const choice = deferred<ThreadActionMenuId | null>();
-      state.show.mockReturnValue(choice.promise);
-      createMenu().openMenu(position);
-      state.granted.delete("secondary");
-      choice.resolve(action);
-      await state.completed.promise;
-      expect(state.effects).toEqual([]);
-    },
-  );
+  it.each([
+    "rename",
+    "regenerate-title",
+    "delete",
+    "pin",
+    "settle",
+    "settle-bridge",
+    "archive",
+  ] as const)("%s rechecks after the native menu closes", async (action) => {
+    state.granted.add("secondary");
+    const choice = deferred<ThreadActionMenuId | null>();
+    state.show.mockReturnValue(choice.promise);
+    createMenu().openMenu(position);
+    state.granted.delete("secondary");
+    choice.resolve(action);
+    await state.completed.promise;
+    expect(state.effects).toEqual([]);
+  });
 
   it("offers find only to a header that can open it, without task permission", async () => {
     createMenu().openMenu(position);
@@ -192,5 +206,25 @@ describe("thread menu permissions", () => {
     expect(items[0]?.disabled).not.toBe(true);
     expect(state.effects).toEqual(["find"]);
     expect(onFind).toHaveBeenCalledExactlyOnceWith(target);
+  });
+});
+
+describe("settle and book hours", () => {
+  it("opens the editable form before settling, and leaves time blank", async () => {
+    state.granted.add("secondary");
+    state.show.mockResolvedValue("settle-bridge");
+    createMenu().openMenu(position);
+    await state.completed.promise;
+    expect(state.effects).toEqual(["open", "settleThread"]);
+    expect(state.openBridge).toHaveBeenCalledOnce();
+  });
+
+  it("does not settle if opening Bridge fails", async () => {
+    state.granted.add("secondary");
+    state.show.mockResolvedValue("settle-bridge");
+    state.openBridge.mockRejectedValueOnce(new Error("unavailable"));
+    createMenu().openMenu(position);
+    await state.completed.promise;
+    expect(state.effects).toEqual([]);
   });
 });

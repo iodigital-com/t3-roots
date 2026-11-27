@@ -26,6 +26,7 @@ import {
 import { titleRegenerationToast } from "../components/threadTitleRegenerationToast";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { copyThreadReference } from "../lib/copyThreadReference";
+import { useBridgeWorklog } from "./useBridgeWorklog";
 import { m } from "../i18n/messages";
 import { threadChipCopyTarget } from "@t3tools/client-runtime/thread-reference";
 import { threadEnvironment } from "../state/threads";
@@ -96,6 +97,7 @@ export function useThreadActionMenu(input: {
     reportFailure: false,
   });
   const handleNewThread = useNewThreadHandler();
+  const openBridge = useBridgeWorklog();
   const confirmThreadDelete = useClientSettings((s) => s.confirmThreadDelete);
   const confirmThreadArchive = useClientSettings((s) => s.confirmThreadArchive);
   const timestampFormat = useClientSettings((s) => s.timestampFormat);
@@ -182,6 +184,28 @@ export function useThreadActionMenu(input: {
         const result = await snoozeThread(threadRef, preset.snoozedUntil);
         if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
           failureToast(m(msg("Failed to snooze thread")), squashAtomCommandFailure(result));
+        }
+        return;
+      }
+      if (action === "settle-bridge") {
+        try {
+          if (
+            !(await openBridge({
+              api,
+              threadRef,
+              title: thread.title,
+              links: thread.issues,
+              position,
+            }))
+          )
+            return;
+        } catch (error) {
+          failureToast(m(msg("Unable to open link.")), error);
+          return;
+        }
+        const result = await settleThread(threadRef);
+        if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+          failureToast(m(msg("Failed to settle thread")), squashAtomCommandFailure(result));
         }
         return;
       }
